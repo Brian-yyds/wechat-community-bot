@@ -100,13 +100,20 @@ class RedactFilter(logging.Filter):
     """对日志记录的消息与参数做脱敏。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = redact(record.msg)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {k: redact(v) if isinstance(v, str) else v for k, v in record.args.items()}
-            else:
-                record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+        # 先格式化再脱敏，避免把模板里的 token=%s 改成 token=*** 导致 TypeError。
+        try:
+            formatted = record.getMessage()
+        except Exception:
+            if record.args:
+                if isinstance(record.args, Mapping):
+                    record.args = {
+                        k: redact(v) if isinstance(v, str) else v for k, v in record.args.items()
+                    }
+                elif isinstance(record.args, tuple):
+                    record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+            return True
+        record.msg = redact(formatted) if isinstance(formatted, str) else formatted
+        record.args = ()
         return True
 
 
