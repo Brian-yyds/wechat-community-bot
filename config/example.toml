@@ -112,12 +112,16 @@ bot_names = []
 [logging]
 level = "INFO"
 
-# 运行模式：改这一行即可切换。
+# 运行模式优先级：data/run_mode.json（set_mode 写入且有效）> 配置 run.mode > 默认 observe。
+# 示例里不写生效的 mode，以免重启时覆盖运行时切换。
 # observe=只读不发（默认） / announce=只发定时公告 / reply=自动回复+公告
-# 配置里显式写出的 mode 优先于 data/run_mode.json；运行中切换会写入该状态文件。
+# 一行切到自动回复：调用 set_mode("reply")，或启动时加 --mode reply，或写：
+#   mode = "reply"
+#   mode_force = true
 # 紧急暂停：在数据目录放置 PAUSE 文件后，任何发送都不会执行（与适配器 B/D 约定一致）。
 [run]
-mode = "observe"
+# mode = "reply"
+# mode_force = true
 
 [pipeline]
 dedup_window_seconds = 600

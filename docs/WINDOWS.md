@@ -36,7 +36,7 @@ Copy-Item config\example.toml config\local.toml
 
 用编辑器打开 `config\local.toml`：
 
-- 运行模式 `run.mode` 默认为 `observe`（只读不发）。专用小号实测自动回复时，把这一行改成 `reply`；若只想发定时公告则改成 `announce`。不必改代码。
+- 运行模式默认为 `observe`（只读不发）。优先级：`data\run_mode.json`（运行时切换写入）> 配置 `run.mode` > 默认 observe。专用小号实测自动回复时，调用 `set_mode("reply")` 或启动时加 `--mode reply`（也可在 `local` 配置写 `mode = "reply"` 且 `mode_force = true`）；只想发定时公告则用 `announce`。不要在示例配置里写生效的 `run.mode`，以免重启覆盖已切换的状态。
 - 填写 `bot.identity` 中本小号的 wxid 与群内昵称，避免回复自己；
 - 按需调整 `rate_limit.global_replies_per_hour`（默认 40）、`group_replies_per_hour`（默认 20）、`global_per_minute`（默认 8）、`group_per_minute`（默认 3）；
 - 拟人随机延迟按场景分档：其余/未打开会话默认 2–6 秒，已打开会话的规则回复默认 1.5–2.4 秒（对准 3 秒端到端，下限默认 ≥1.5 秒，可配），公告默认同其余档；夜间静默默认开启（00:30–07:00），静默期自动回复会被丢弃、不会排队补发；
