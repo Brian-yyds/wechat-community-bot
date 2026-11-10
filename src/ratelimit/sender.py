@@ -519,6 +519,17 @@ class HumanizedSender:
             trace.sent_at = self.clock.now()
         if adapter_send_s is not None:
             trace.adapter_send_s = adapter_send_s
+        if self.send_gate is not None and not getattr(trace, "run_mode", None):
+            getter = getattr(self.send_gate, "get_mode", None)
+            if callable(getter):
+                try:
+                    trace.run_mode = getter()
+                except Exception:
+                    pass
+            else:
+                mode = getattr(self.send_gate, "mode", None)
+                if mode is not None:
+                    trace.run_mode = mode.value if hasattr(mode, "value") else str(mode)
         if self.latency_store is not None:
             self.latency_store.write(trace)
 

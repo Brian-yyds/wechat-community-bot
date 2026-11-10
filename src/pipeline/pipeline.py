@@ -115,7 +115,8 @@ class Pipeline:
         if session_open is None and message.extra:
             if "session_open" in message.extra:
                 session_open = bool(message.extra["session_open"])
-        preview = (message.content or "")[:80]
+        # 正文只在内存里用于生成长度/哈希，落盘时不会写入明文。
+        preview = message.content or ""
         trace = LatencyTrace(
             message_id=message.message_id,
             group_id=message.group_id,
@@ -193,6 +194,9 @@ class Pipeline:
 
         trace.decided_at = self.clock.now()
         trace.decision_s = time.perf_counter() - decision_started
+        if reply_id:
+            trace.reply_id = reply_id
+            trace.rule_reply = True
         if not queued:
             trace.outcome = "no_send" if not reply_text else "queued_skipped"
 
