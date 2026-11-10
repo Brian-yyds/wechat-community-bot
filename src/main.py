@@ -29,8 +29,11 @@ from src.pipeline.guard import IdentityConfig, ReplyGuard, StormConfig
 from src.pipeline.provider import RuleReplyProvider
 from src.pipeline.reply import ReplyEngine, rule_from_mapping
 from src.pipeline.sink import JsonlSink
+from src.adapters.pause import PauseGate
+from src.latency import LATENCY_JSONL_NAME, LatencyStore
 from src.ratelimit.bucket import BucketSpec, RateLimitConfig, RateLimiter
 from src.ratelimit.sender import HumanizeConfig, HumanizedSender, NightSilentConfig, parse_hhmm
+from src.run_mode import RunModeError, SendGate, parse_run_mode
 from src.scheduler.scheduler import AnnouncementScheduler, announcement_from_mapping
 from src.safety import ForbiddenContentError
 
@@ -64,19 +67,28 @@ def _bucket(raw: dict[str, Any] | None, capacity: float, refill: float) -> Bucke
     )
 
 
+def _limit_int(section: dict[str, Any], key: str, default: int | None) -> int | None:
+    """读取可配的次数上限。缺省用 default；显式空值表示关闭该上限。"""
+    if key not in section:
+        return default
+    value = section[key]
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
 def build_rate_limiter(config: dict[str, Any], clock: Clock) -> tuple[RateLimiter, HumanizeConfig]:
     section = config.get("rate_limit") or {}
-    group_hour = section.get("group_replies_per_hour")
     limiter = RateLimiter(
         RateLimitConfig(
             global_bucket=_bucket(section.get("global"), 8, 0.25),
             per_group=_bucket(section.get("per_group"), 3, 0.1),
             announcement=_bucket((section.get("quotas") or {}).get("announcement"), 4, 0.1),
             auto_reply=_bucket((section.get("quotas") or {}).get("auto_reply"), 6, 0.2),
-            global_replies_per_hour=int(section.get("global_replies_per_hour", 40)),
-            group_replies_per_hour=int(group_hour) if group_hour not in (None, "") else None,
-            global_per_minute=int(section["global_per_minute"]) if section.get("global_per_minute") else None,
-            group_per_minute=int(section["group_per_minute"]) if section.get("group_per_minute") else None,
+            global_replies_per_hour=_limit_int(section, "global_replies_per_hour", 40),
+            group_replies_per_hour=_limit_int(section, "group_replies_per_hour", 20),
+            global_per_minute=_limit_int(section, "global_per_minute", 8),
+            group_per_minute=_limit_int(section, "group_per_minute", 3),
         ),
         clock=clock,
     )
@@ -115,13 +127,33 @@ def build_app(
         data_dir = project_root / data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        run_mode = parse_run_mode((config.get("run") or {}).get("mode"))
+    except RunModeError as exc:
+        raise ConfigError(str(exc)) from exc
+    pause_gate = PauseGate(data_dir=data_dir)
+    latency_raw = (config.get("pipeline") or {}).get("latency_path")
+    latency_path = Path(latency_raw) if latency_raw else (data_dir / LATENCY_JSONL_NAME)
+    if not latency_path.is_absolute():
+        latency_path = project_root / latency_path
+    latency_store = LatencyStore(latency_path)
+    send_gate = SendGate(mode=run_mode, pause_gate=pause_gate)
+
     groups = []
     for raw in config.get("groups") or [{"group_id": "demo-group", "name": "交易会员群演示"}]:
         groups.append(Group(group_id=str(raw["group_id"]), name=str(raw.get("name") or raw["group_id"])))
     adapter = build_adapter(config, groups=groups, clock=clock)
 
     limiter, humanize = build_rate_limiter(config, clock)
-    sender = HumanizedSender(adapter, limiter, config=humanize, clock=clock, rng=rng or Random())
+    sender = HumanizedSender(
+        adapter,
+        limiter,
+        config=humanize,
+        clock=clock,
+        rng=rng or Random(),
+        send_gate=send_gate,
+        latency_store=latency_store,
+    )
 
     pipe_cfg = config.get("pipeline") or {}
     ident_raw = (config.get("bot") or {}).get("identity") or pipe_cfg.get("identity") or {}
@@ -174,6 +206,7 @@ def build_app(
         sender=sender,
         clock=clock,
         on_result=results.append,
+        latency_store=latency_store,
     )
     adapter.subscribe(pipeline.handle_event)
 
@@ -194,6 +227,10 @@ def build_app(
         "results": results,
         "data_dir": data_dir,
         "jsonl_path": jsonl_path,
+        "latency_path": latency_path,
+        "latency_store": latency_store,
+        "send_gate": send_gate,
+        "run_mode": run_mode,
         "clock": clock,
     }
 
@@ -226,6 +263,10 @@ def run_demo(
         rate["night_silent"] = night
         config = dict(config)
         config["rate_limit"] = rate
+        # 演示必须实际发出，才能看完自动回复和公告；示例配置默认是 observe。
+        run = dict(config.get("run") or {})
+        run["mode"] = "reply"
+        config["run"] = run
 
     if clock is None:
         clock = FakeClock(datetime(2026, 11, 11, 9, 0, 5)) if demo_fast else SystemClock()
