@@ -19,10 +19,12 @@ import json
 import random
 import sys
 import threading
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import deque
 from collections.abc import Iterable
 from typing import Any
 
@@ -48,6 +50,35 @@ DEFAULT_DIALOG_LABELS = (
 
 DEFAULT_INPUT_LABELS = ("输入", "发送消息", "请输入")
 DEFAULT_SEND_LABELS = ("发送", "Send")
+
+# 直接调用 send_text 时仍生效的每小时上限（与产品默认 40 条一致）。
+DEFAULT_REPLIES_PER_HOUR = 40
+
+
+def normalize_ui_text(text: str) -> str:
+    """规范化 UI 文本后再做精确比较：兼容字符、全半角、空白、大小写。"""
+    if not text:
+        return ""
+    folded = unicodedata.normalize("NFKC", str(text)).casefold()
+    return "".join(ch for ch in folded if not ch.isspace())
+
+
+def texts_match_exactly(left: str, right: str) -> bool:
+    """规范化后完全相等才算匹配，禁止子串互相包含。"""
+    a = normalize_ui_text(left)
+    b = normalize_ui_text(right)
+    return bool(a) and a == b
+
+
+def box_center(box: "TextBox") -> "ScreenPoint":
+    return ScreenPoint(
+        x=box.x + box.width // 2,
+        y=box.y + box.height // 2,
+        text=box.text,
+        confidence=box.confidence,
+    )
+
+
 
 
 class RateLimitedError(RuntimeError):
@@ -335,22 +366,28 @@ class FakeScreenDriver(ScreenDriver):
         *,
         min_confidence: float = DEFAULT_OCR_THRESHOLD,
     ) -> ScreenPoint | None:
-        needle = text.strip()
-        if not needle:
+        matches = self.locate_all_exact(text, min_confidence=min_confidence)
+        if not matches:
             return None
+        return matches[0]
+
+    def locate_all_exact(
+        self,
+        text: str,
+        *,
+        min_confidence: float = DEFAULT_OCR_THRESHOLD,
+    ) -> list[ScreenPoint]:
+        """返回所有规范化后精确相等的位置。"""
+        needle = normalize_ui_text(text)
+        if not needle:
+            return []
+        hits: list[ScreenPoint] = []
         for box in self.elements:
-            if not box.text.strip():
-                continue
             if box.confidence < min_confidence:
                 continue
-            if needle in box.text or box.text in needle:
-                return ScreenPoint(
-                    x=box.x + box.width // 2,
-                    y=box.y + box.height // 2,
-                    text=box.text,
-                    confidence=box.confidence,
-                )
-        return None
+            if normalize_ui_text(box.text) == needle:
+                hits.append(box_center(box))
+        return hits
 
     def visible_text(self) -> str:
         parts = [box.text for box in self.elements]
@@ -551,11 +588,18 @@ class OcrOutboundAdapter(OutboundAdapter):
             driver = FakeScreenDriver()
             engine = FakeOcrEngine()
         pause_file = section.get("pause_file") or section.get("pause_flag")
+        rate_section = root.get("rate_limit") or {}
+        if not isinstance(rate_section, dict):
+            rate_section = {}
+        per_hour = section.get("global_replies_per_hour")
+        if per_hour is None:
+            per_hour = rate_section.get("global_replies_per_hour", DEFAULT_REPLIES_PER_HOUR)
         return cls(
             driver=driver,
             engine=engine,
             limiter=limiter,
             enforce_rate_limit=bool(section.get("enforce_rate_limit", False)),
+            global_replies_per_hour=int(per_hour),
             pause=PauseGate(path=pause_file, data_dir=data_dir),
             data_dir=data_dir,
             clock=clock,
@@ -590,6 +634,7 @@ class OcrOutboundAdapter(OutboundAdapter):
         idempotency_window_seconds: float = 600.0,
         confirm_group_name: bool = True,
         send_kind: str = "auto_reply",
+        global_replies_per_hour: int = DEFAULT_REPLIES_PER_HOUR,
     ) -> None:
         self.driver = driver or FakeScreenDriver()
         self.engine = engine or FakeOcrEngine()
@@ -607,6 +652,8 @@ class OcrOutboundAdapter(OutboundAdapter):
         self.max_rate_wait_seconds = float(max_rate_wait_seconds)
         self.confirm_group_name = bool(confirm_group_name)
         self.send_kind = send_kind
+        self.global_replies_per_hour = int(global_replies_per_hour)
+        self._hour_sends: deque[datetime] = deque()
         data_root = Path(data_dir) if data_dir is not None else Path("data")
         self.pause = pause or PauseGate(data_dir=data_root)
         self._idem = SendIdempotencyLog(
@@ -654,6 +701,15 @@ class OcrOutboundAdapter(OutboundAdapter):
                 "同一群同一文案在幂等窗口内已发送过，跳过以避免重复。",
             )
 
+        if self._hourly_limit_reached():
+            return OcrSendResult(
+                False,
+                "rate_limited",
+                group_id,
+                text,
+                f"已达到每小时 {self.global_replies_per_hour} 条上限，本轮不发送。",
+            )
+
         if self.limiter is not None and self.enforce_rate_limit:
             now = self.clock.now()
             wait = self.limiter.time_until_allow(group_id, self.send_kind, now)
@@ -697,15 +753,10 @@ class OcrOutboundAdapter(OutboundAdapter):
             return OcrSendResult(False, "captcha_or_dialog", group_id, text, reason)
 
         if self.confirm_group_name:
-            display = self.group_names.get(group_id, group_id)
-            if not self._locate_any((display, group_id), image):
-                return OcrSendResult(
-                    False,
-                    "group_not_confirmed",
-                    group_id,
-                    text,
-                    f"未能在屏幕上确认群名「{display}」，为避免发错会话已中止。",
-                )
+            confirm_error, unique = self._confirm_group_name(group_id, image, ocr)
+            if confirm_error:
+                status = "group_not_confirmed"
+                return OcrSendResult(False, status, group_id, text, confirm_error)
 
         input_pt = self._locate_any(self.input_labels, image)
         send_pt = self._locate_any(self.send_labels, image)
@@ -727,6 +778,7 @@ class OcrOutboundAdapter(OutboundAdapter):
             )
             with self._lock:
                 self._sent.append(record)
+            self._record_hourly()
             return OcrSendResult(True, "dry_run", group_id, text, dry_run=True)
 
         self.driver.click(input_pt.x, input_pt.y)
@@ -746,7 +798,91 @@ class OcrOutboundAdapter(OutboundAdapter):
         )
         with self._lock:
             self._sent.append(record)
+        self._record_hourly()
         return OcrSendResult(True, "ok", group_id, text)
+
+    def _hourly_limit_reached(self) -> bool:
+        """适配器内统一限额：即使未注入 RateLimiter / 关闭 enforce_rate_limit 也生效。"""
+        limit = self.global_replies_per_hour
+        if limit <= 0:
+            return False
+        now = self.clock.now()
+        cutoff = now - timedelta(hours=1)
+        with self._lock:
+            while self._hour_sends and self._hour_sends[0] <= cutoff:
+                self._hour_sends.popleft()
+            return len(self._hour_sends) >= limit
+
+    def _record_hourly(self) -> None:
+        if self.global_replies_per_hour <= 0:
+            return
+        with self._lock:
+            self._hour_sends.append(self.clock.now())
+
+    def _iter_screen_boxes(self, ocr: OcrResult | None = None) -> list[TextBox]:
+        boxes: list[TextBox] = []
+        if hasattr(self.driver, "elements"):
+            boxes.extend(list(getattr(self.driver, "elements") or []))
+        if ocr is not None:
+            boxes.extend(list(ocr.boxes or []))
+        return boxes
+
+    def _exact_group_matches(
+        self,
+        label: str,
+        image: Any,
+        ocr: OcrResult | None = None,
+    ) -> list[ScreenPoint]:
+        if hasattr(self.driver, "locate_all_exact"):
+            found = list(self.driver.locate_all_exact(label))
+            if found:
+                return found
+        needle = normalize_ui_text(label)
+        if not needle:
+            return []
+        hits: list[ScreenPoint] = []
+        seen: set[tuple[int, int, str]] = set()
+        for box in self._iter_screen_boxes(ocr):
+            if box.confidence < DEFAULT_OCR_THRESHOLD:
+                continue
+            if normalize_ui_text(box.text) != needle:
+                continue
+            point = box_center(box)
+            key = (point.x, point.y, point.text)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(point)
+        return hits
+
+    def _confirm_group_name(
+        self,
+        group_id: str,
+        image: Any,
+        ocr: OcrResult | None = None,
+    ) -> tuple[str | None, bool]:
+        """规范化后精确匹配当前群名。
+
+        返回 (错误信息, 是否唯一命中)。无匹配或匹配不唯一时不发送；
+        不唯一或不确定时写入 PAUSE。
+        """
+        display = self.group_names.get(group_id, group_id)
+        if not normalize_ui_text(display):
+            return "目标群名为空，无法确认当前会话，已中止。", False
+        matches = self._exact_group_matches(display, image, ocr)
+        if len(matches) == 1:
+            return None, True
+        if len(matches) > 1:
+            reason = (
+                f"屏幕上群名「{display}」匹配不唯一（{len(matches)} 处），"
+                "已紧急暂停，避免发错会话。"
+            )
+            self.pause.pause(reason)
+            return reason, False
+        return (
+            f"未能在屏幕上确认群名「{display}」，为避免发错会话已中止。",
+            False,
+        )
 
     def _input_pause(self) -> float:
         lo = max(0.0, self.input_pause_min)
