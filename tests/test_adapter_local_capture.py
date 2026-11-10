@@ -464,3 +464,92 @@ def test_assert_readonly_rejects_writable_and_closes(tmp_path: Path, monkeypatch
     assert "probe" not in {r["msg_id"] for r in db.all_messages()}
     reader.close()
 
+
+
+def test_trim_then_db_replace_does_not_replay_trimmed_ids(tmp_path: Path, caplog):
+    """被 trim_seen_window 裁掉的 ID 在库文件替换后不得重放；只放行水位线之后的消息。"""
+    src = tmp_path / "live.db"
+    db = SimulatedWeChatDB(src)
+    t0 = datetime(2026, 11, 11, 9, 0, 0, tzinfo=SHANGHAI)
+    old_ids = [f"hist-{i:04d}" for i in range(40)]
+    for i, mid in enumerate(old_ids):
+        db.insert(msg_id=mid, group_id="g1", sender_id="u", content=mid, ts=t0 + timedelta(seconds=i))
+    cursor = tmp_path / "cursor.json"
+    reader = LocalDbReader(src, cursor_store=cursor, seen_ids_max=5, seen_seq_window=5)
+    got = reader.poll(limit=200)
+    assert [m["msg_id"] for m in got] == old_ids
+    seen = set(reader.get_cursor()["seen_ids"])
+    assert len(seen) <= 5
+    trimmed = [mid for mid in old_ids if mid not in seen]
+    assert trimmed, "应有被窗口裁掉的历史 ID"
+    assert reader.get_cursor().get("watermark_ts")
+    reader.close()
+
+    replacement = tmp_path / "new.db"
+    db2 = SimulatedWeChatDB(replacement)
+    for i, mid in enumerate(old_ids):
+        db2.insert(msg_id=mid, group_id="g1", sender_id="u", content=mid, ts=t0 + timedelta(seconds=i))
+    # 水位线之前的未见 ID：新库里多出来的历史消息，应忽略并记日志，不得重放。
+    db2.insert(
+        msg_id="ghost-old",
+        group_id="g1",
+        sender_id="u",
+        content="不应重放的正文",
+        ts=t0 + timedelta(seconds=1),
+    )
+    db2.insert(
+        msg_id="fresh-1",
+        group_id="g1",
+        sender_id="u",
+        content="新消息",
+        ts=t0 + timedelta(seconds=60),
+    )
+    os.replace(replacement, src)
+
+    with caplog.at_level(logging.INFO):
+        reader2 = LocalDbReader(src, cursor_store=cursor, seen_ids_max=5, seen_seq_window=5)
+        got2 = reader2.poll(limit=200)
+        ids2 = [m["msg_id"] for m in got2]
+        assert ids2 == ["fresh-1"]
+        for mid in trimmed:
+            assert mid not in ids2
+        assert "ghost-old" not in ids2
+        # 对账可以发现水位线之前的未见 ID，但补抓不得重放。
+        filled = reader2.reconcile_recent(seq_back=10000, limit=5000)
+        assert "ghost-old" not in [m["msg_id"] for m in filled]
+        assert [m["msg_id"] for m in filled] == []
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "水位线之前" in log_text
+    assert "不重放" in log_text
+    assert "不应重放的正文" not in log_text
+    reader2.close()
+
+
+def test_out_of_order_timestamp_still_emitted_without_replace(tmp_path: Path):
+    """正常增量路径不能用时间戳水位线挡住乱序较早的新消息。"""
+    db = _make_simple_db(tmp_path)
+    t0 = datetime(2026, 11, 11, 10, 0, 0, tzinfo=SHANGHAI)
+    db.insert(msg_id="a", group_id="g1", sender_id="u", content="a", ts=t0 + timedelta(seconds=10))
+    reader = LocalDbReader(db.path, cursor_store={})
+    assert [m["msg_id"] for m in reader.poll()] == ["a"]
+    db.insert(msg_id="b-early", group_id="g1", sender_id="u", content="b", ts=t0 + timedelta(seconds=1))
+    assert [m["msg_id"] for m in reader.poll()] == ["b-early"]
+    reader.close()
+
+
+def test_selfcheck_simulate_is_idempotent_even_with_leftover_bak(tmp_path: Path):
+    """自检必须清掉 .bak / 损坏文件（或使用临时目录），重复运行结果一致。"""
+    from scripts.selfcheck_local_capture import check_simulate
+
+    root = Path(__file__).resolve().parents[1]
+    leftover_ids = ["sim-0", "sim-1", "sim-2", "sim-3", "sim-image", "sim-self", "sim-new"]
+    (tmp_path / "local_capture_cursor.json.bak").write_text(
+        json.dumps({"last_seq": 99, "seen_ids": leftover_ids}),
+        encoding="utf-8",
+    )
+    (tmp_path / "local_capture_cursor.json.tmp").write_text("{}", encoding="utf-8")
+    (tmp_path / "local_capture_cursor.json.corrupt-old").write_text("{", encoding="utf-8")
+    ok1, msg1 = check_simulate(root, tmp_path)
+    assert ok1, msg1
+    ok2, msg2 = check_simulate(root, tmp_path)
+    assert ok2, msg2
