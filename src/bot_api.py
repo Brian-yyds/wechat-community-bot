@@ -10,19 +10,30 @@ from __future__ import annotations
 
 import hashlib
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time, timezone
 from typing import Any, Iterable, Optional
 
+from src.humanize import (
+    DEFAULT_OPEN_SESSION,
+    DEFAULT_OTHER,
+    humanize_delay as _humanize_delay,
+    humanize_delay_range as _humanize_delay_range,
+    validate_latency_config as _validate_latency_config,
+)
 from src.logging_util import redact
+from src.persist import atomic_write_json, read_json
 from src.pipeline.classify import SAFE_QUESTION_REPLY, Category, Classifier
 
 SHANGHAI = timezone(timedelta(hours=8))
 CATEGORIES = ["提问", "行情讨论", "广告刷屏", "公告回复", "闲聊/无关", "需人工"]
 FORBIDDEN_CATEGORY = Category.FORBIDDEN.value
 
-# 拟人发送间隔（秒）：须满足 1.5 ≤ 下限 < 上限 ≤ 8，且上限 + 2s ≤ 12s。
-HUMANIZE_DEFAULT = (2.0, 6.0)
+# 拟人发送间隔（秒）。默认 2–6s 只用于其余/未打开会话（8s 目标）。
+# 已打开会话的规则回复走短区间 1.5–2.4s，保证端到端 ≤3s。下限默认为 1.5s，可配置。
+HUMANIZE_DEFAULT = DEFAULT_OTHER
+HUMANIZE_OPEN_SESSION = DEFAULT_OPEN_SESSION
 NIGHT_SILENCE = ("00:30", "07:00")
 CATCH_UP_WINDOW_DEFAULT = 600
 
@@ -54,18 +65,46 @@ def classify(message: dict) -> dict:
     }
 
 
-def humanize_delay_range() -> tuple[float, float]:
-    """当前拟人发送延迟区间（秒）。"""
-    return HUMANIZE_DEFAULT
+def humanize_delay_range(path: str | None = None) -> tuple[float, float]:
+    """当前拟人发送延迟区间（秒）。
+
+    path 缺省为其余/未打开会话档（2–6s）。
+    path='open_session_rule' 为已打开会话的规则回复短区间（默认 1.5–2.4s）。
+    path='announcement' 为公告档（默认同其余档，可配）。
+    """
+    return _humanize_delay_range(path)
 
 
-def validate_latency_config(p95_max: float = 12.0, process_budget: float = 2.0) -> bool:
-    lo, hi = humanize_delay_range()
-    if not (1.5 <= lo < hi <= 8.0):
-        raise ValueError(f"拟人化区间非法: {(lo, hi)}")
-    if hi + process_budget > p95_max:
-        raise ValueError("拟人化上限与 P95 目标不相容")
-    return True
+def humanize_delay(
+    text: str = "",
+    *,
+    rng: random.Random | None = None,
+    path: str | None = None,
+) -> float:
+    """计算一次拟人延迟（秒），不睡眠。
+
+    可注入随机源 rng，便于复现。空文本落在该档区间内；
+    长文本附加打字时间。打开会话路径的打字时间含在短区间内。
+    """
+    return _humanize_delay(text, rng=rng, path=path)
+
+
+def validate_latency_config(
+    p95_max: float | None = None,
+    process_budget: float | None = None,
+    path: str | None = None,
+    *,
+    profiles=None,
+) -> bool:
+    """校验拟人区间与该路径 P95 目标相容。非法组合将抛出 ValueError。"""
+    kwargs = {}
+    if p95_max is not None:
+        kwargs["p95_max"] = p95_max
+    if process_budget is not None:
+        kwargs["process_budget"] = process_budget
+    if profiles is not None:
+        kwargs["profiles"] = profiles
+    return _validate_latency_config(path=path, **kwargs)
 
 
 def redact_log(line: str) -> str:
@@ -219,6 +258,8 @@ class RateLimiter:
         night_end: str = NIGHT_SILENCE[1],
         humanize: tuple[float, float] | None = None,
         rng: random.Random | None = None,
+        store: dict[str, Any] | None = None,
+        state_path: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         # 兼容仅关键字传入的测试调用
@@ -228,6 +269,10 @@ class RateLimiter:
             global_per_minute = kwargs["global_per_minute"]
         if "content_cooldown_seconds" in kwargs:
             content_cooldown_seconds = kwargs["content_cooldown_seconds"]
+        if "store" in kwargs:
+            store = kwargs["store"]
+        if "state_path" in kwargs:
+            state_path = kwargs["state_path"]
         self.group_per_minute = group_per_minute
         self.global_per_minute = global_per_minute
         self.global_per_hour = global_per_hour
@@ -237,7 +282,54 @@ class RateLimiter:
         self.night_end = _parse_hhmm(night_end)
         self.humanize = humanize or humanize_delay_range()
         self.rng = rng or random.Random()
+        self.store = store
+        self.state_path = Path(state_path) if state_path else None
         self._events: list[tuple[datetime, str, str, str]] = []
+        self._load_events()
+
+    def _load_events(self) -> None:
+        raw = None
+        if isinstance(self.store, dict) and self.store.get("rate_events"):
+            raw = self.store.get("rate_events")
+        elif self.state_path is not None:
+            loaded = read_json(self.state_path, default=None)
+            if isinstance(loaded, dict):
+                raw = loaded.get("rate_events")
+            elif isinstance(loaded, list):
+                raw = loaded
+        events: list[tuple[datetime, str, str, str]] = []
+        for item in raw or []:
+            try:
+                if isinstance(item, dict):
+                    ts = _ensure_tz(datetime.fromisoformat(str(item["ts"])))
+                    events.append((ts, str(item.get("group") or ""), str(item.get("kind") or "reply"), str(item.get("hash") or "")))
+                elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                    ts = item[0]
+                    if isinstance(ts, str):
+                        ts = datetime.fromisoformat(ts)
+                    events.append((_ensure_tz(ts), str(item[1]), str(item[2]), str(item[3])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        self._events = events
+        # 不在载入时用墙上时钟裁剪：测试与重启恢复会传入业务 now，由 allow/record 裁剪。
+        self._sync_store()
+
+    def _trim_events(self, now: datetime) -> None:
+        now = _ensure_tz(now)
+        # 保留一小时窗口与内容冷却所需的记录。
+        cool = max(float(self.content_cooldown_seconds or 0), 3600.0)
+        cutoff = now - timedelta(seconds=cool)
+        self._events = [e for e in self._events if e[0] > cutoff]
+
+    def _sync_store(self) -> None:
+        payload = [
+            {"ts": ts.isoformat(), "group": g, "kind": k, "hash": h}
+            for ts, g, k, h in self._events
+        ]
+        if isinstance(self.store, dict):
+            self.store["rate_events"] = payload
+        if self.state_path is not None:
+            atomic_write_json(self.state_path, {"rate_events": payload})
 
     def in_night_silence(self, now: datetime) -> bool:
         now = _ensure_tz(now)
@@ -251,6 +343,7 @@ class RateLimiter:
 
     def allow(self, *, group, content_hash, now, kind="reply") -> bool:
         now = _ensure_tz(now)
+        self._trim_events(now)
         window_start = now - timedelta(minutes=1)
         recent = [e for e in self._events if e[0] > window_start]
         if len(recent) >= self.global_per_minute:
@@ -275,6 +368,8 @@ class RateLimiter:
     def record(self, *, group, content_hash, now, kind="reply") -> None:
         now = _ensure_tz(now)
         self._events.append((now, group, kind, content_hash))
+        self._trim_events(now)
+        self._sync_store()
 
     def next_delay(self) -> float:
         lo, hi = self.humanize
@@ -324,6 +419,10 @@ class OutboundGateway:
         res = SendResult(True, group, text, now, delay, False, "")
         self.history.append(res)
         return res
+
+
+# 核查约定接口名。与 OutboundGateway 为同一实现。
+Sender = OutboundGateway
 
 
 # ---------------------------------------------------------------------------
