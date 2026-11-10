@@ -13,17 +13,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.adapters.textnorm import normalize_ui_text, texts_match_exactly
+
 
 def normalize_chat_title(name: str | None) -> str:
-    """规范化会话标题：去掉首尾空白并压缩中间空白，便于精确匹配。"""
-    return " ".join((name or "").strip().split())
+    """规范化会话标题：NFKC、去掉空白、大小写折叠，再做严格精确匹配。"""
+    return normalize_ui_text(name)
 
 
 def titles_match(actual: str | None, expected: str | None) -> bool:
-    """规范化后严格精确匹配。同名前缀或仅部分相同一律视为不匹配。"""
-    left = normalize_chat_title(actual)
-    right = normalize_chat_title(expected)
-    return bool(left) and left == right
+    """规范化后严格精确匹配。同名前缀、子串或部分相同一律视为不匹配。"""
+    return texts_match_exactly(actual, expected)
 
 
 class UiaError(Exception):
