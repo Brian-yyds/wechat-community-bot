@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import json
 import sys
 from datetime import datetime
@@ -77,8 +78,16 @@ def _limit_int(section: dict[str, Any], key: str, default: int | None) -> int | 
     return int(value)
 
 
-def build_rate_limiter(config: dict[str, Any], clock: Clock) -> tuple[RateLimiter, HumanizeConfig]:
+def build_rate_limiter(
+    config: dict[str, Any],
+    clock: Clock,
+    data_dir: Path | None = None,
+) -> tuple[RateLimiter, HumanizeConfig]:
     section = config.get("rate_limit") or {}
+    state_path = None
+    if data_dir is not None:
+        raw_path = section.get("window_state_path")
+        state_path = Path(raw_path) if raw_path else (Path(data_dir) / "rate_limit_window.json")
     limiter = RateLimiter(
         RateLimitConfig(
             global_bucket=_bucket(section.get("global"), 8, 0.25),
@@ -91,6 +100,7 @@ def build_rate_limiter(config: dict[str, Any], clock: Clock) -> tuple[RateLimite
             group_per_minute=_limit_int(section, "group_per_minute", 3),
         ),
         clock=clock,
+        state_path=state_path,
     )
     night_raw = section.get("night_silent") or {}
     night = NightSilentConfig(
@@ -100,9 +110,22 @@ def build_rate_limiter(config: dict[str, Any], clock: Clock) -> tuple[RateLimite
         announcement_policy=str(night_raw.get("announcement_policy", "hold")),
         auto_reply_policy=str(night_raw.get("auto_reply_policy", "drop")),
     )
+    humanize_sec = section.get("humanize") or {}
+
+    def _delay(key: str, default: float) -> float:
+        if key in section and section[key] is not None:
+            return float(section[key])
+        if key in humanize_sec and humanize_sec[key] is not None:
+            return float(humanize_sec[key])
+        return float(default)
+
     humanize = HumanizeConfig(
-        send_delay_min=float(section.get("send_delay_min", 2.0)),
-        send_delay_max=float(section.get("send_delay_max", 6.0)),
+        send_delay_min=_delay("send_delay_min", 2.0),
+        send_delay_max=_delay("send_delay_max", 6.0),
+        open_session_delay_min=_delay("open_session_delay_min", 1.5),
+        open_session_delay_max=_delay("open_session_delay_max", 2.4),
+        announcement_delay_min=_delay("announcement_delay_min", 2.0),
+        announcement_delay_max=_delay("announcement_delay_max", 6.0),
         typing_hook=bool(section.get("typing_hook", True)),
         typing_duration_min=float(section.get("typing_duration_min", 0.3)),
         typing_duration_max=float(section.get("typing_duration_max", 1.0)),
@@ -127,24 +150,36 @@ def build_app(
         data_dir = project_root / data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    run_cfg = config.get("run") or {}
+    mode_raw = run_cfg.get("mode")
+    # 配置文件显式写了 run.mode 时以配置为准；否则尝试恢复状态文件。
+    config_explicit = "mode" in run_cfg and mode_raw not in (None, "")
     try:
-        run_mode = parse_run_mode((config.get("run") or {}).get("mode"))
+        run_mode = parse_run_mode(mode_raw if config_explicit else None)
     except RunModeError as exc:
-        raise ConfigError(str(exc)) from exc
+        # 非法配置默认安全：回到 observe 继续只读运行，而不是拒绝启动。
+        logging.getLogger("wechat_bot").warning("非法运行模式，已回退到 observe: %s", exc)
+        run_mode = parse_run_mode("observe")
+        config_explicit = True
     pause_gate = PauseGate(data_dir=data_dir)
     latency_raw = (config.get("pipeline") or {}).get("latency_path")
     latency_path = Path(latency_raw) if latency_raw else (data_dir / LATENCY_JSONL_NAME)
     if not latency_path.is_absolute():
         latency_path = project_root / latency_path
     latency_store = LatencyStore(latency_path)
-    send_gate = SendGate(mode=run_mode, pause_gate=pause_gate)
+    send_gate = SendGate(
+        mode=run_mode,
+        pause_gate=pause_gate,
+        state_path=data_dir / "run_mode.json",
+        config_explicit=config_explicit,
+    )
 
     groups = []
     for raw in config.get("groups") or [{"group_id": "demo-group", "name": "交易会员群演示"}]:
         groups.append(Group(group_id=str(raw["group_id"]), name=str(raw.get("name") or raw["group_id"])))
     adapter = build_adapter(config, groups=groups, clock=clock)
 
-    limiter, humanize = build_rate_limiter(config, clock)
+    limiter, humanize = build_rate_limiter(config, clock, data_dir=data_dir)
     sender = HumanizedSender(
         adapter,
         limiter,
@@ -256,6 +291,10 @@ def run_demo(
         rate = dict(config.get("rate_limit") or {})
         rate.setdefault("send_delay_min", 0.0)
         rate.setdefault("send_delay_max", 0.05)
+        rate.setdefault("open_session_delay_min", 0.0)
+        rate.setdefault("open_session_delay_max", 0.05)
+        rate.setdefault("announcement_delay_min", 0.0)
+        rate.setdefault("announcement_delay_max", 0.05)
         rate.setdefault("typing_duration_min", 0.0)
         rate.setdefault("typing_duration_max", 0.02)
         night = dict(rate.get("night_silent") or {})
