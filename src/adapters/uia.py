@@ -545,8 +545,9 @@ class UiaOutboundAdapter(OutboundAdapter):
                     raise ChatNotFoundError("按下发送前窗口标题已不是目标群，拒绝发送以免发错群")
                 if time.perf_counter() > deadline:
                     raise SendTimeoutError("按下发送前已超时")
-                self.driver.press_send()
+                # 一旦调用 press_send，无论是否抛错都视为可能已发出，不得重试。
                 pressed = True
+                self.driver.press_send()
                 self._last_send_at = self.clock.now()
                 timings.send += time.perf_counter() - t_send
 
@@ -610,6 +611,16 @@ class UiaOutboundAdapter(OutboundAdapter):
                 if attempts >= max_tries:
                     break
                 continue
+            except Exception as exc:  # noqa: BLE001
+                # 打开会话 / 粘贴 / 发送 / 校验过程中的非 UiaError 不得冲出 send()。
+                last_status = UiaSendStatus.UI_NOT_READY
+                last_error = f"发送过程异常: {exc}"
+                self._trigger_pause("send_unexpected", last_error)
+                if pressed:
+                    if send_id:
+                        self._store.mark(send_id, UiaSendStatus.MAYBE_SENT)
+                    return _finish(False, UiaSendStatus.MAYBE_SENT, last_error, attempts=attempts)
+                return _finish(False, last_status, last_error, attempts=attempts)
 
         return _finish(False, last_status, last_error, attempts=attempts)
 
