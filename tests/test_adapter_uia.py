@@ -12,7 +12,7 @@ from src.adapters.composite import CompositeAdapter
 from src.adapters.factory import build_adapter
 from src.adapters.mock import MockAdapter
 from src.adapters.roles import IMPLEMENTED_OUTBOUND, OUTBOUND_UIA, PENDING_SLOTS
-from src.adapters.ui_driver import FakeUiDriver, UiaDependencyError
+from src.adapters.ui_driver import FakeUiDriver, UiaDependencyError, normalize_chat_title, titles_match
 from src.adapters.uia import (
     UiaConfig,
     UiaOutboundAdapter,
@@ -372,3 +372,66 @@ def test_wechat_bot_pause_file_env_is_honored(tmp_path: Path, monkeypatch):
     cfg = UiaConfig(data_dir=str(tmp_path / "data"), pause_flag="data/PAUSE")
     resolved = cfg.resolve_pause_flag(tmp_path)
     assert resolved == env_flag
+
+
+def test_titles_match_uses_nfkc_and_rejects_prefix():
+    """全半角、空白、大小写规范化后精确匹配；同名前缀不得命中。"""
+    from src.adapters.textnorm import normalize_ui_text
+
+    assert titles_match("交易会员群－主群", "交易会员群-主群")
+    assert titles_match("  交易会员群-主群  ", "交易会员群-主群")
+    assert titles_match("交易会员群\u3000主群", "交易会员群 主群")
+    assert titles_match("Demo Group", "demo group")
+    assert not titles_match("交易会员群", "交易会员群-主群")
+    assert not titles_match("交易会员群-主", "交易会员群-主群")
+    assert not titles_match("", "交易会员群-主群")
+    assert not titles_match("", "")
+    assert normalize_chat_title(" 交易会员群－主群 ") == normalize_ui_text("交易会员群-主群")
+
+
+def test_fullwidth_title_sends_to_correct_chat(tmp_path: Path):
+    class WidthTitleDriver(FakeUiDriver):
+        def read_chat_title(self) -> str | None:
+            if self.current == "交易会员群-主群":
+                return "交易会员群－主群"
+            return self.current
+
+    driver = WidthTitleDriver(known_chats={"交易会员群-主群"})
+    adapter = _adapter(tmp_path, driver=driver)
+    result = adapter.send("g1", "全半角应能匹配")
+    assert result.ok, result.error
+    assert driver.pressed == ["交易会员群-主群"]
+
+
+def test_paste_runtime_error_is_contained_and_writes_pause(tmp_path: Path):
+    class BoomPaste(FakeUiDriver):
+        def paste_text(self, text: str) -> None:
+            raise RuntimeError("粘贴时意外失败")
+
+    driver = BoomPaste(known_chats={"交易会员群-主群"})
+    adapter = _adapter(tmp_path, driver=driver)
+    result = adapter.send("g1", "异常应收敛")
+    assert result is not None
+    assert not result.ok
+    assert result.status in {UiaSendStatus.UI_NOT_READY, UiaSendStatus.PAUSED, UiaSendStatus.UNKNOWN}
+    assert (tmp_path / "PAUSE").exists()
+    assert driver.pressed == []
+
+
+def test_press_send_runtime_error_is_maybe_sent_and_not_retried(tmp_path: Path):
+    class BoomPress(FakeUiDriver):
+        def press_send(self) -> None:
+            raise RuntimeError("按下时意外失败")
+
+    driver = BoomPress(known_chats={"交易会员群-主群"})
+    adapter = _adapter(tmp_path, driver=driver)
+    result = adapter.send("g1", "按下后异常", send_id="press-boom")
+    assert result is not None
+    assert not result.ok
+    assert result.status == UiaSendStatus.MAYBE_SENT
+    assert (tmp_path / "PAUSE").exists()
+    # 同一 send_id 不得重试
+    again = adapter.send("g1", "按下后异常", send_id="press-boom")
+    assert again.skipped
+    assert again.status == UiaSendStatus.MAYBE_SENT
+
