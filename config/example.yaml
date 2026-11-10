@@ -4,8 +4,77 @@
 wechat:
   protocol: mock
   protocol_type: mock
+  # A 读 + B 发时 inbound: local_capture，outbound: uia
   inbound: mock
   outbound: mock
+
+# 适配器 A：本地库只读抓取。密钥不要写在本文件。
+# 使用环境变量 WECHAT_LOCAL_DB_KEY / WECHAT_LOCAL_DB_KEY_FILE，或已解密 SQLite 副本。
+# 真实表结构须在用户 Windows 上用 scripts/selfcheck_local_capture.py 验证。
+inbound:
+  local_capture:
+    db_path: ""
+    cursor_path: data/local_capture_cursor.json
+    poll_interval_seconds: 1.0
+    poll_jitter_seconds: 0.1
+    poll_timeout: 2.0
+    lock_retries: 10
+    lock_retry_delay_seconds: 0.03
+    group_whitelist: [demo-group]
+    schema:
+      messages_table: messages
+      groups_table: chatrooms
+      contacts_table: contacts
+      msg_id_col: msg_id
+      group_id_col: group_id
+      sender_id_col: sender_id
+      sender_name_col: sender_name
+      timestamp_col: ts
+      content_col: content
+      seq_col: create_seq
+      msg_type_col: msg_type
+      group_pk_col: wxid
+      group_name_col: name
+  # C 通知预览旁路。enabled=true 时催促 A 立即轮询。见 docs/ADAPTER_C.md。
+  notification:
+    enabled: false
+    source: fake
+    poll_interval_seconds: 1.0
+    suppressed_groups: []
+    wake_a_on_preview: true
+
+# 适配器 B：官方 PC 微信 UIA 发送。仅在用户 Windows 把 wechat.outbound 改为 uia。
+# 紧急暂停与 D 共用 data/PAUSE。详见 docs/ADAPTER_B.md。
+outbound:
+  uia:
+    pause_flag: data/PAUSE
+    max_retries: 2
+    send_timeout_seconds: 8.0
+    input_pause_min: 0.12
+    input_pause_max: 0.35
+    group_switch_interval_min: 0.35
+    group_switch_interval_max: 0.70
+    min_send_interval_seconds: 0.80
+    keep_chat_open: true
+    preheat_on_start: true
+    preheat_groups: [demo-group]
+    return_to_primary_after_send: true
+    reopen_min_interval_seconds: 30
+    primary_group: demo-group
+    target_open_chat_seconds: 3.0
+    target_unopened_chat_seconds: 8.0
+    group_names:
+      demo-group: 交易会员群演示
+  # D OCR 降级发送。box 上保持 fake + dry_run。见 docs/ADAPTER_D.md。
+  ocr:
+    driver: fake
+    engine: tesseract
+    dry_run: true
+    confirm_group_name: true
+    input_pause_min: 0.4
+    input_pause_max: 1.2
+    idempotency_window_seconds: 600
+    enforce_rate_limit: false
 
 bot:
   data_dir: data
@@ -17,6 +86,11 @@ bot:
 
 logging:
   level: INFO
+
+# 运行模式：改这一行即可切换。observe / announce / reply。默认 observe。
+# 紧急暂停：在数据目录放置 PAUSE 文件后，任何发送都不会执行。
+run:
+  mode: observe
 
 pipeline:
   dedup_window_seconds: 600
@@ -31,6 +105,9 @@ pipeline:
 
 rate_limit:
   global_replies_per_hour: 40
+  group_replies_per_hour: 20
+  global_per_minute: 8
+  group_per_minute: 3
   send_delay_min: 2.0
   send_delay_max: 6.0
   typing_hook: true

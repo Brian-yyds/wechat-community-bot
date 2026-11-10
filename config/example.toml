@@ -2,9 +2,94 @@
 [wechat]
 protocol = "mock"
 protocol_type = "mock"
-# 读取与发送可分开配置，后续可组合 A 读 + B 发 等。第一阶段均为 mock。
+# 读取与发送可分开配置，例如 inbound=local_capture + outbound=mock/uia。
+# 默认仍为 mock，便于演示；A 读 + B 发时 inbound="local_capture"、outbound="uia"。
 inbound = "mock"
 outbound = "mock"
+# inbound = "notification"  # C，非全量，见 docs/ADAPTER_C.md
+# outbound = "ocr"          # D，降级发送，见 docs/ADAPTER_D.md
+
+# 适配器 A：个人微信本地库只读增量抓取。密钥不要写在本文件，使用环境变量
+# WECHAT_LOCAL_DB_KEY / WECHAT_LOCAL_DB_KEY_FILE，或事先准备已解密的 SQLite 副本。
+# 真实 4.x 表结构须在用户 Windows 上用 scripts/selfcheck_local_capture.py 验证。
+[inbound.local_capture]
+db_path = ""
+cursor_path = "data/local_capture_cursor.json"
+# 默认约 1 秒轮询，带 ±0.1 秒抖动，使增量检出延迟尽量 <1s。
+poll_interval_seconds = 1.0
+poll_jitter_seconds = 0.1
+poll_timeout = 2.0
+lock_retries = 10
+lock_retry_delay_seconds = 0.03
+# 只抓交易会员群白名单；全量抓取不依赖会话是否打开、是否免打扰或折叠。
+group_whitelist = ["demo-group"]
+# self_ids 也可沿用 [bot.identity]；用于给自己发出的消息打 is_self 标记。
+# require_key = false  # 明文/已解密库无需密钥；加密模式且未配置密钥会报清晰错误。
+
+[inbound.local_capture.schema]
+# 默认对齐本仓库模拟库。真实微信 4.x 的表名/列名请按自检结果修改。
+messages_table = "messages"
+groups_table = "chatrooms"
+contacts_table = "contacts"
+msg_id_col = "msg_id"
+group_id_col = "group_id"
+sender_id_col = "sender_id"
+sender_name_col = "sender_name"
+timestamp_col = "ts"
+content_col = "content"
+seq_col = "create_seq"
+msg_type_col = "msg_type"
+group_pk_col = "wxid"
+group_name_col = "name"
+
+
+# 适配器 B：官方 PC 微信 UIA 发送。仅在用户 Windows 电脑把 wechat.outbound 改为 "uia"。
+# box 上请保持 outbound=mock，或使用 FakeUiDriver 模拟。详见 docs/ADAPTER_B.md。
+# 紧急暂停与 D 共用 data/PAUSE（或环境变量 WECHAT_BOT_PAUSE_FILE）。
+[outbound.uia]
+pause_flag = "data/PAUSE"
+max_retries = 2
+send_timeout_seconds = 8.0
+input_pause_min = 0.12
+input_pause_max = 0.35
+group_switch_interval_min = 0.35
+group_switch_interval_max = 0.70
+min_send_interval_seconds = 0.80
+keep_chat_open = true
+preheat_on_start = true
+preheat_groups = ["demo-group"]
+return_to_primary_after_send = true
+reopen_min_interval_seconds = 30
+primary_group = "demo-group"
+target_open_chat_seconds = 3.0
+target_unopened_chat_seconds = 8.0
+
+[outbound.uia.group_names]
+demo-group = "交易会员群演示"
+
+
+# 适配器 C：通知 / 会话列表预览，只能作唤醒辅助，不能全量抓取。见 docs/ADAPTER_C.md。
+# 当 inbound 使用 local_capture 时，把 enabled 设为 true 可在有预览时催促 A 立即轮询。
+[inbound.notification]
+enabled = false
+source = "fake"              # fake（box 测试）或 windows（未验证骨架）
+poll_interval_seconds = 1.0
+suppressed_groups = []
+wake_a_on_preview = true
+
+# 适配器 D：OCR 降级发送，仅为 UIA 失效时的备选，延迟可能十余秒。见 docs/ADAPTER_D.md。
+# box 上请保持 driver=fake，并保持 dry_run=true。紧急暂停与 B 共用 data/PAUSE。
+[outbound.ocr]
+driver = "fake"              # fake（box 测试）或 windows（未验证骨架）
+engine = "tesseract"         # tesseract 或 rapidocr（仅 windows 驱动）
+dry_run = true
+confirm_group_name = true
+input_pause_min = 0.4
+input_pause_max = 1.2
+idempotency_window_seconds = 600
+# 经 HumanizedSender 发送时保持 false，避免令牌被扣两次
+enforce_rate_limit = false
+# pause_file = "data/PAUSE"
 
 # 示例配置（可直接用于演示）。真实密钥与本地覆盖请使用 config/local.toml（已 gitignore）。
 # 本项目严禁配置任何博彩 / 六合彩 / 下注 / 结算 / 收款相关规则或文案。
@@ -22,17 +107,23 @@ bot_names = []
 [logging]
 level = "INFO"
 
+# 运行模式：改这一行即可切换。
+# observe=只读不发（默认） / announce=只发定时公告 / reply=自动回复+公告
+# 紧急暂停：在数据目录放置 PAUSE 文件后，任何发送都不会执行（与适配器 B/D 约定一致）。
+[run]
+mode = "observe"
+
 [pipeline]
 dedup_window_seconds = 600
 jsonl_path = "data/records.jsonl"
 # qa_file = "config/qa_example.json"  # 也可把问答库拆到独立文件
 
 [rate_limit]
-# 全局每小时自动回复上限（可配），单群与每分钟上限也可配。
+# 全局每小时自动回复上限默认 40；单群与每分钟上限、拟人延迟、夜间静默均可配。
 global_replies_per_hour = 40
-# group_replies_per_hour = 20
-# global_per_minute = 8
-# group_per_minute = 3
+group_replies_per_hour = 20
+global_per_minute = 8
+group_per_minute = 3
 send_delay_min = 2.0
 send_delay_max = 6.0
 typing_hook = true

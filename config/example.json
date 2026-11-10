@@ -19,6 +19,9 @@
   "logging": {
     "level": "INFO"
   },
+  "run": {
+    "mode": "observe"
+  },
   "pipeline": {
     "dedup_window_seconds": 600,
     "jsonl_path": "data/records.jsonl",
@@ -32,6 +35,10 @@
     }
   },
   "rate_limit": {
+    "global_replies_per_hour": 40,
+    "group_replies_per_hour": 20,
+    "global_per_minute": 8,
+    "group_per_minute": 3,
     "send_delay_min": 2.0,
     "send_delay_max": 6.0,
     "typing_hook": true,
@@ -62,8 +69,7 @@
       "end": "07:00",
       "announcement_policy": "hold",
       "auto_reply_policy": "drop"
-    },
-    "global_replies_per_hour": 40
+    }
   },
   "groups": [
     {
@@ -126,5 +132,76 @@
       ],
       "enabled": true
     }
-  ]
+  ],
+  "inbound": {
+    "local_capture": {
+      "db_path": "",
+      "cursor_path": "data/local_capture_cursor.json",
+      "poll_interval_seconds": 1.0,
+      "poll_jitter_seconds": 0.1,
+      "poll_timeout": 2.0,
+      "lock_retries": 10,
+      "lock_retry_delay_seconds": 0.03,
+      "group_whitelist": [
+        "demo-group"
+      ],
+      "schema": {
+        "messages_table": "messages",
+        "groups_table": "chatrooms",
+        "contacts_table": "contacts",
+        "msg_id_col": "msg_id",
+        "group_id_col": "group_id",
+        "sender_id_col": "sender_id",
+        "sender_name_col": "sender_name",
+        "timestamp_col": "ts",
+        "content_col": "content",
+        "seq_col": "create_seq",
+        "msg_type_col": "msg_type",
+        "group_pk_col": "wxid",
+        "group_name_col": "name"
+      }
+    },
+    "notification": {
+      "enabled": false,
+      "source": "fake",
+      "poll_interval_seconds": 1.0,
+      "suppressed_groups": [],
+      "wake_a_on_preview": true
+    }
+  },
+  "outbound": {
+    "uia": {
+      "pause_flag": "data/PAUSE",
+      "max_retries": 2,
+      "send_timeout_seconds": 8.0,
+      "input_pause_min": 0.12,
+      "input_pause_max": 0.35,
+      "group_switch_interval_min": 0.35,
+      "group_switch_interval_max": 0.7,
+      "min_send_interval_seconds": 0.8,
+      "keep_chat_open": true,
+      "preheat_on_start": true,
+      "preheat_groups": [
+        "demo-group"
+      ],
+      "return_to_primary_after_send": true,
+      "reopen_min_interval_seconds": 30,
+      "primary_group": "demo-group",
+      "target_open_chat_seconds": 3.0,
+      "target_unopened_chat_seconds": 8.0,
+      "group_names": {
+        "demo-group": "交易会员群演示"
+      }
+    },
+    "ocr": {
+      "driver": "fake",
+      "engine": "tesseract",
+      "dry_run": true,
+      "confirm_group_name": true,
+      "input_pause_min": 0.4,
+      "input_pause_max": 1.2,
+      "idempotency_window_seconds": 600,
+      "enforce_rate_limit": false
+    }
+  }
 }
