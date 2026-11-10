@@ -6,8 +6,10 @@ import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from src.clock import Clock, SystemClock
+from src.persist import atomic_write_json, read_json
 
 
 @dataclass(frozen=True)
@@ -89,9 +91,15 @@ class TokenBucket:
 class RateLimiter:
     """组合全局、单群、类型配额三类令牌桶。只有全部通过才扣令牌。"""
 
-    def __init__(self, config: RateLimitConfig, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        config: RateLimitConfig,
+        clock: Clock | None = None,
+        state_path: str | Path | None = None,
+    ) -> None:
         self.config = config
         self._clock = clock or SystemClock()
+        self.state_path = Path(state_path) if state_path else None
         self.global_bucket = TokenBucket(config.global_bucket, clock=self._clock)
         self.announcement_bucket = TokenBucket(config.announcement, clock=self._clock)
         self.auto_reply_bucket = TokenBucket(config.auto_reply, clock=self._clock)
@@ -101,6 +109,7 @@ class RateLimiter:
         self._group_hour: dict[str, deque[datetime]] = defaultdict(deque)
         self._global_minute: deque[datetime] = deque()
         self._group_minute: dict[str, deque[datetime]] = defaultdict(deque)
+        self._load_windows()
 
     def _group_bucket(self, group_id: str) -> TokenBucket:
         with self._lock:
@@ -147,6 +156,57 @@ class RateLimiter:
                     return True
         return False
 
+    def _parse_ts(self, raw: object) -> datetime | None:
+        try:
+            if isinstance(raw, datetime):
+                return raw
+            return datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+
+    def _load_windows(self) -> None:
+        if self.state_path is None:
+            return
+        data = read_json(self.state_path, default=None)
+        if not isinstance(data, dict):
+            return
+        now = self._clock.now()
+        def _fill(seq, window):
+            q: deque[datetime] = deque()
+            for raw in seq or []:
+                ts = self._parse_ts(raw)
+                if ts is not None:
+                    q.append(ts)
+            self._trim(q, now, window)
+            return q
+        with self._lock:
+            self._global_hour = _fill(data.get("global_hour"), 3600)
+            self._global_minute = _fill(data.get("global_minute"), 60)
+            self._group_hour = defaultdict(deque)
+            for gid, seq in (data.get("group_hour") or {}).items():
+                self._group_hour[str(gid)] = _fill(seq, 3600)
+            self._group_minute = defaultdict(deque)
+            for gid, seq in (data.get("group_minute") or {}).items():
+                self._group_minute[str(gid)] = _fill(seq, 60)
+
+    def _save_windows(self, now: datetime | None = None) -> None:
+        if self.state_path is None:
+            return
+        now = now or self._clock.now()
+        with self._lock:
+            self._trim(self._global_hour, now, 3600)
+            self._trim(self._global_minute, now, 60)
+            payload = {
+                "global_hour": [ts.isoformat() for ts in self._global_hour],
+                "global_minute": [ts.isoformat() for ts in self._global_minute],
+                "group_hour": {gid: [ts.isoformat() for ts in q] for gid, q in self._group_hour.items() for _ in (self._trim(q, now, 3600),) if True},
+                "group_minute": {gid: [ts.isoformat() for ts in q] for gid, q in self._group_minute.items() for _ in (self._trim(q, now, 60),) if True},
+            }
+        try:
+            atomic_write_json(self.state_path, payload)
+        except OSError:
+            pass
+
     def _record_windows(self, group_id: str, kind: str, now: datetime) -> None:
         if kind != "auto_reply":
             return
@@ -155,6 +215,7 @@ class RateLimiter:
             self._group_hour[group_id].append(now)
             self._global_minute.append(now)
             self._group_minute[group_id].append(now)
+        self._save_windows(now)
 
     def try_acquire(self, group_id: str, kind: str, now: datetime | None = None) -> bool:
         """尝试同时占用全局、单群与类型配额。失败时不扣减任何桶。"""
@@ -188,6 +249,29 @@ class RateLimiter:
             for bucket in reversed(ordered):
                 bucket._lock.release()
 
+    def _window_wait(self, group_id: str, kind: str, now: datetime) -> float:
+        """滑动窗口还需等待的秒数。非自动回复不占用这些窗口。"""
+        if kind != "auto_reply":
+            return 0.0
+        cfg = self.config
+
+        def wait_for(bucket: deque, window: float, limit: int | None) -> float:
+            if not limit:
+                return 0.0
+            self._trim(bucket, now, window)
+            if len(bucket) < limit:
+                return 0.0
+            oldest = bucket[0]
+            return max(0.0, (oldest + timedelta(seconds=window) - now).total_seconds())
+
+        with self._lock:
+            return max(
+                wait_for(self._global_hour, 3600, cfg.global_replies_per_hour),
+                wait_for(self._group_hour[group_id], 3600, cfg.group_replies_per_hour),
+                wait_for(self._global_minute, 60, cfg.global_per_minute),
+                wait_for(self._group_minute[group_id], 60, cfg.group_per_minute),
+            )
+
     def time_until_allow(self, group_id: str, kind: str, now: datetime | None = None) -> float:
         now = now or self._clock.now()
         group = self._group_bucket(group_id)
@@ -196,4 +280,5 @@ class RateLimiter:
             self.global_bucket.time_until_allow(1.0, now),
             group.time_until_allow(1.0, now),
             quota.time_until_allow(1.0, now),
+            self._window_wait(group_id, kind, now),
         )
