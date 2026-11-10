@@ -1,0 +1,13 @@
+{
+  "replies": [
+    {
+      "id": "welcome_qa",
+      "priority": 90,
+      "keywords": ["群规", "怎么提问"],
+      "reply": "请直接在群内简明提问，避免发广告或导流信息。本助手只做整理与提醒。",
+      "cooldown_seconds": 300,
+      "groups": ["*"],
+      "enabled": true
+    }
+  ]
+}

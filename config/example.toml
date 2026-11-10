@@ -1,0 +1,114 @@
+# 协议自报：第一阶段仅本地模拟，未接入真实微信协议。详见 docs/PROTOCOL_RISK.md
+[wechat]
+protocol = "mock"
+protocol_type = "mock"
+# 读取与发送可分开配置，后续可组合 A 读 + B 发 等。第一阶段均为 mock。
+inbound = "mock"
+outbound = "mock"
+
+# 示例配置（可直接用于演示）。真实密钥与本地覆盖请使用 config/local.toml（已 gitignore）。
+# 本项目严禁配置任何博彩 / 六合彩 / 下注 / 结算 / 收款相关规则或文案。
+
+[bot]
+data_dir = "data"
+
+[bot.identity]
+# 填写本小号的 wxid / 群内昵称，避免回复自己发出的消息。
+self_ids = []
+self_names = ["交易助手"]
+bot_ids = []
+bot_names = []
+
+[logging]
+level = "INFO"
+
+[pipeline]
+dedup_window_seconds = 600
+jsonl_path = "data/records.jsonl"
+# qa_file = "config/qa_example.json"  # 也可把问答库拆到独立文件
+
+[rate_limit]
+# 全局每小时自动回复上限（可配），单群与每分钟上限也可配。
+global_replies_per_hour = 40
+# group_replies_per_hour = 20
+# global_per_minute = 8
+# group_per_minute = 3
+send_delay_min = 2.0
+send_delay_max = 6.0
+typing_hook = true
+typing_duration_min = 0.3
+typing_duration_max = 1.0
+max_rate_wait_seconds = 30
+
+[rate_limit.global]
+capacity = 8
+refill_per_second = 0.25
+
+[rate_limit.per_group]
+capacity = 3
+refill_per_second = 0.1
+
+[rate_limit.quotas.announcement]
+capacity = 4
+refill_per_second = 0.1
+
+[rate_limit.quotas.auto_reply]
+capacity = 6
+refill_per_second = 0.2
+
+[rate_limit.night_silent]
+# 默认开启；静默期内不主动发公告（暂存），自动回复直接丢弃、不排队补发。
+enabled = true
+start = "00:30"
+end = "07:00"
+announcement_policy = "hold"
+auto_reply_policy = "drop"
+
+[[groups]]
+group_id = "demo-group"
+name = "交易会员群演示"
+
+[[announcements]]
+id = "morning_hello"
+text = "各位会员早上好。请注意风险控制，有问题直接在群内提问。本提醒不构成投资建议。"
+groups = ["demo-group"]
+schedule = "09:00"
+jitter_seconds = 3
+catch_up = true
+catch_up_max_minutes = 10
+enabled = true
+
+[[replies]]
+id = "greeting"
+priority = 100
+keywords = ["你好", "在吗", "大家好"]
+reply = "您好，我是群助手。有问题请直接在群里提问，请注意风险自担。"
+cooldown_seconds = 120
+groups = ["*"]
+enabled = true
+
+[[replies]]
+id = "risk"
+priority = 80
+keywords = ["风险", "止损"]
+reply = "市场有风险，决策需谨慎。本群只做信息整理与提醒，不构成投资建议。"
+cooldown_seconds = 180
+groups = ["*"]
+enabled = true
+
+[[replies]]
+id = "howto_ask"
+priority = 50
+pattern = "怎么看|如何理解"
+reply = "可以在群里补充你关注的标的与时间范围，管理员或同伴看到会一起讨论。请注意风险自担。"
+cooldown_seconds = 180
+groups = ["*"]
+enabled = true
+
+[pipeline.storm]
+group_burst_max = 5
+group_window_seconds = 60
+group_cool_seconds = 180
+global_burst_max = 15
+global_window_seconds = 60
+global_cool_seconds = 180

@@ -1,0 +1,130 @@
+{
+  "wechat": {
+    "protocol": "mock",
+    "protocol_type": "mock",
+    "inbound": "mock",
+    "outbound": "mock"
+  },
+  "bot": {
+    "data_dir": "data",
+    "identity": {
+      "self_ids": [],
+      "self_names": [
+        "交易助手"
+      ],
+      "bot_ids": [],
+      "bot_names": []
+    }
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "pipeline": {
+    "dedup_window_seconds": 600,
+    "jsonl_path": "data/records.jsonl",
+    "storm": {
+      "group_burst_max": 5,
+      "group_window_seconds": 60,
+      "group_cool_seconds": 180,
+      "global_burst_max": 15,
+      "global_window_seconds": 60,
+      "global_cool_seconds": 180
+    }
+  },
+  "rate_limit": {
+    "send_delay_min": 2.0,
+    "send_delay_max": 6.0,
+    "typing_hook": true,
+    "typing_duration_min": 0.3,
+    "typing_duration_max": 1.0,
+    "max_rate_wait_seconds": 30,
+    "global": {
+      "capacity": 8,
+      "refill_per_second": 0.25
+    },
+    "per_group": {
+      "capacity": 3,
+      "refill_per_second": 0.1
+    },
+    "quotas": {
+      "announcement": {
+        "capacity": 4,
+        "refill_per_second": 0.1
+      },
+      "auto_reply": {
+        "capacity": 6,
+        "refill_per_second": 0.2
+      }
+    },
+    "night_silent": {
+      "enabled": true,
+      "start": "00:30",
+      "end": "07:00",
+      "announcement_policy": "hold",
+      "auto_reply_policy": "drop"
+    },
+    "global_replies_per_hour": 40
+  },
+  "groups": [
+    {
+      "group_id": "demo-group",
+      "name": "交易会员群演示"
+    }
+  ],
+  "announcements": [
+    {
+      "id": "morning_hello",
+      "text": "各位会员早上好。请注意风险控制，有问题直接在群内提问。本提醒不构成投资建议。",
+      "groups": [
+        "demo-group"
+      ],
+      "schedule": "09:00",
+      "jitter_seconds": 3,
+      "catch_up": true,
+      "catch_up_max_minutes": 10,
+      "enabled": true
+    }
+  ],
+  "replies": [
+    {
+      "id": "greeting",
+      "priority": 100,
+      "keywords": [
+        "你好",
+        "在吗",
+        "大家好"
+      ],
+      "reply": "您好，我是群助手。有问题请直接在群里提问，请注意风险自担。",
+      "cooldown_seconds": 120,
+      "groups": [
+        "*"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "risk",
+      "priority": 80,
+      "keywords": [
+        "风险",
+        "止损"
+      ],
+      "reply": "市场有风险，决策需谨慎。本群只做信息整理与提醒，不构成投资建议。",
+      "cooldown_seconds": 180,
+      "groups": [
+        "*"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "howto_ask",
+      "priority": 50,
+      "pattern": "怎么看|如何理解",
+      "reply": "可以在群里补充你关注的标的与时间范围，管理员或同伴看到会一起讨论。请注意风险自担。",
+      "cooldown_seconds": 180,
+      "groups": [
+        "*"
+      ],
+      "enabled": true
+    }
+  ]
+}
