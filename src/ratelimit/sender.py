@@ -18,6 +18,15 @@ from typing import TYPE_CHECKING, Callable
 
 from src.adapters.base import Adapter
 from src.clock import Clock, SystemClock
+from src.humanize import (
+    DEFAULT_ANNOUNCEMENT,
+    DEFAULT_OPEN_SESSION,
+    DEFAULT_OTHER,
+    PATH_ANNOUNCEMENT,
+    PATH_OPEN_SESSION_RULE,
+    PATH_OTHER,
+    HumanizeProfiles,
+)
 from src.ratelimit.bucket import RateLimitConfig, RateLimiter
 
 if TYPE_CHECKING:
@@ -49,6 +58,7 @@ class SendItem:
     seq: int = 0
     # LatencyTrace，避免发送器与打点模块形成运行时循环导入。
     trace: object | None = None
+    session_open: bool | None = None
     rate_wait: float = 0.0
     humanize_delay: float = 0.0
     typing_delay: float = 0.0
@@ -65,13 +75,29 @@ class NightSilentConfig:
 
 @dataclass
 class HumanizeConfig:
-    send_delay_min: float = 2.0
-    send_delay_max: float = 6.0
+    send_delay_min: float = DEFAULT_OTHER[0]
+    send_delay_max: float = DEFAULT_OTHER[1]
+    open_session_delay_min: float | None = None
+    open_session_delay_max: float | None = None
+    announcement_delay_min: float | None = None
+    announcement_delay_max: float | None = None
     typing_hook: bool = True
     typing_duration_min: float = 0.3
     typing_duration_max: float = 1.0
     night: NightSilentConfig = field(default_factory=NightSilentConfig)
     max_rate_wait_seconds: float = 30.0
+
+    def profiles(self) -> HumanizeProfiles:
+        # 未单独配置时：打开会话走默认短区间；公告跟随其余档（兼容只改 send_delay_* 的测试与旧配置）。
+        open_lo = DEFAULT_OPEN_SESSION[0] if self.open_session_delay_min is None else self.open_session_delay_min
+        open_hi = DEFAULT_OPEN_SESSION[1] if self.open_session_delay_max is None else self.open_session_delay_max
+        ann_lo = self.send_delay_min if self.announcement_delay_min is None else self.announcement_delay_min
+        ann_hi = self.send_delay_max if self.announcement_delay_max is None else self.announcement_delay_max
+        return HumanizeProfiles(
+            other=(self.send_delay_min, self.send_delay_max),
+            open_session_rule=(open_lo, open_hi),
+            announcement=(ann_lo, ann_hi),
+        )
 
 
 class HumanizedSender:
@@ -131,11 +157,13 @@ class HumanizedSender:
         if isinstance(kind, str):
             kind = SendKind(kind)
         now = self.clock.now()
+        session_open = None
         if trace is not None:
             trace.queued_at = now
             if not trace.group_id:
                 trace.group_id = group_id
             trace.kind = kind.value
+            session_open = getattr(trace, "session_open", None)
         item = SendItem(
             group_id=group_id,
             text=text,
@@ -143,6 +171,7 @@ class HumanizedSender:
             priority=DEFAULT_PRIORITY[kind] if priority is None else priority,
             created_at=now,
             trace=trace,
+            session_open=session_open,
         )
         with self._cv:
             self._seq += 1
@@ -248,6 +277,13 @@ class HumanizedSender:
         wait = self.limiter.time_until_allow(item.group_id, item.kind.value, now)
         if wait > self.config.max_rate_wait_seconds:
             # 等待过久则先放回，避免阻塞其他类型；测试时钟会记录这次 sleep 前的判断。
+            self.logger.info(
+                "超过限速上限，需再等 %.1fs（超过可等待 %.1fs），先放回队列 kind=%s group=%s",
+                wait,
+                self.config.max_rate_wait_seconds,
+                item.kind.value,
+                item.group_id,
+            )
             with self._cv:
                 self._heap.append((item.priority, item.seq, item))
                 self._heap.sort(key=lambda x: (x[0], x[1]))
@@ -258,20 +294,24 @@ class HumanizedSender:
             self.clock.sleep(wait)
             item.rate_wait += wait
 
-        delay = self._random_between(self.config.send_delay_min, self.config.send_delay_max)
+        path = self._path_for(item)
+        lo, hi = self.config.profiles().range_for(path)
+        delay = self._random_between(lo, hi)
         item.humanize_delay = delay
         if delay > 0:
             self.clock.sleep(delay)
 
         if self.config.typing_hook:
             self.adapter.notify_typing(item.group_id)
-            typing = self._random_between(
-                self.config.typing_duration_min,
-                self.config.typing_duration_max,
-            )
-            item.typing_delay = typing
-            if typing > 0:
-                self.clock.sleep(typing)
+            # 打开会话短区间已包含拟人停顿，不再叠加「正在输入」等待，以免超过 3s 目标。
+            if path != PATH_OPEN_SESSION_RULE:
+                typing = self._random_between(
+                    self.config.typing_duration_min,
+                    self.config.typing_duration_max,
+                )
+                item.typing_delay = typing
+                if typing > 0:
+                    self.clock.sleep(typing)
 
         # 限速：延迟过后再次获取令牌；若仍不足则短等再试。
         now = self.clock.now()
@@ -364,6 +404,17 @@ class HumanizedSender:
                     return None
             _, _, item = self._heap.pop(0)
             return item
+
+    def _path_for(self, item: SendItem) -> str:
+        """按发送类型与会话是否已打开选择拟人档。"""
+        if item.kind is SendKind.ANNOUNCEMENT:
+            return PATH_ANNOUNCEMENT
+        session_open = item.session_open
+        if session_open is None and item.trace is not None:
+            session_open = getattr(item.trace, "session_open", None)
+        if session_open:
+            return PATH_OPEN_SESSION_RULE
+        return PATH_OTHER
 
     def _night_policy(self, item: SendItem, now: datetime) -> str | None:
         night = self.config.night
