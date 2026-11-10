@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -164,13 +165,50 @@ def _seed_sim(path: Path) -> None:
     build_simulated_wechat_db(path, contacts=contacts, groups=groups, messages=messages)
 
 
+def _cleanup_cursor_artifacts(store: Path) -> None:
+    """删除主游标以及 .bak / .tmp / 隔离的损坏文件。
+
+    主文件缺失时 LocalDbReader 会回退 .bak（这是预期行为，不改读取器）。
+    自检每次都必须清干净，否则第二次运行会误用备份游标，表现为全漏抓。
+    """
+    candidates = [
+        store,
+        store.with_suffix(store.suffix + ".bak"),
+        store.with_suffix(store.suffix + ".tmp"),
+    ]
+    for path in candidates:
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+    parent = store.parent
+    if parent.is_dir():
+        for path in parent.glob(f"{store.name}.corrupt-*"):
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
+
+
 def check_simulate(root: Path, data_dir: Path) -> tuple[bool, str]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # 兼容旧版自检直接把游标写在 data_dir 下的残留。
+    _cleanup_cursor_artifacts(data_dir / "local_capture_cursor.json")
+    with tempfile.TemporaryDirectory(prefix="run_", dir=str(data_dir)) as raw:
+        work = Path(raw)
+        return _check_simulate_in(root, work)
+
+
+def _check_simulate_in(root: Path, work: Path) -> tuple[bool, str]:
     from src.adapters.local_db import LocalDbReader, catch_up, insert_simulated_message, reconcile
 
-    db_path = data_dir / "simulated_wechat.db"
-    store = data_dir / "local_capture_cursor.json"
-    if store.exists():
-        store.unlink()
+    db_path = work / "simulated_wechat.db"
+    store = work / "local_capture_cursor.json"
+    _cleanup_cursor_artifacts(store)
+    if db_path.exists():
+        db_path.unlink()
     _seed_sim(db_path)
     whitelist = ["muted@chatroom", "fold@chatroom", "idle@chatroom", "open@chatroom"]
     reader = LocalDbReader(
