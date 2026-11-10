@@ -3,6 +3,7 @@
 
 可在 Windows 与 Linux box 上运行。默认 dry-run：只探测环境，不向任何会话发送。
 真实发送仅在用户明确传入 --send-test 且确认语正确时，发到「文件传输助手」。
+该路径走 HumanizedSender + SendGate + RateLimiter，受 PAUSE 约束，并计入正式限额（不是白名单豁免）。
 
 用法（仓库根目录）：
     python scripts/selfcheck_uia.py
@@ -219,24 +220,63 @@ def maybe_real_send(args, root: Path, config: dict) -> tuple[bool, str]:
     target = args.target or DEFAULT_TARGET
     if target != DEFAULT_TARGET:
         return False, f"真实发送目标必须是「{DEFAULT_TARGET}」，当前为 {target}，已拒绝。"
-    from src.adapters.uia import UiaConfig, UiaOutboundAdapter
+    from src.adapters.pause import PauseGate
     from src.adapters.pyweixin_driver import PyWeixinDriver
+    from src.adapters.uia import UiaConfig, UiaOutboundAdapter
+    from src.clock import SystemClock
+    from src.main import build_rate_limiter
+    from src.ratelimit.sender import HumanizedSender, NightSilentConfig, SendKind
+    from src.run_mode import SendGate, parse_run_mode
 
     cfg = UiaConfig.from_mapping(config, project_root=root)
     flag = cfg.resolve_pause_flag(root)
-    if flag.exists():
-        return False, f"存在紧急暂停标记 {flag}，拒绝发送"
+    pause_gate = PauseGate(flag)
+    if pause_gate.is_paused() or flag.exists():
+        return False, f"存在紧急暂停标记 {flag}，拒绝发送（--send-test 也不能绕过 PAUSE）"
+
+    run_cfg = config.get("run") or {}
+    try:
+        run_mode = parse_run_mode(run_cfg.get("mode") or "reply")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"运行模式无法解析，拒绝发送: {exc}"
+
+    clock = SystemClock()
+    data_dir = cfg.resolve_data_dir(root)
+    limiter, _humanize = build_rate_limiter(config, clock, data_dir=data_dir)
+    # 仍走正式限速配额（计入窗口，不是白名单豁免）；拟人延迟与夜间静默对明确确认的自检关闭，
+    # 但运行模式、PAUSE 与 RateLimiter 一律生效。
+    from src.ratelimit.sender import HumanizeConfig
+
     adapter = UiaOutboundAdapter(driver=PyWeixinDriver(), config=cfg, project_root=root)
-    result = adapter.send(
-        target,
-        "【自检】wechat-community-bot UIA 发送测试，请忽略。",
-        timeout=cfg.send_timeout_seconds,
-        send_id=None,
+    sender = HumanizedSender(
+        adapter,
+        limiter,
+        config=HumanizeConfig(
+            send_delay_min=0.0,
+            send_delay_max=0.0,
+            typing_hook=False,
+            night=NightSilentConfig(enabled=False),
+        ),
+        clock=clock,
+        send_gate=SendGate(mode=run_mode, pause_gate=pause_gate),
     )
+    text = "【自检】wechat-community-bot UIA 发送测试，请忽略。"
+    sender.submit(target, text, SendKind.AUTO_REPLY)
+    sent = sender.pump(max_items=1)
+    result = adapter.last_result
+    if sent != 1 or result is None:
+        reason = ""
+        if result is not None:
+            reason = result.error or result.status
+        return False, (
+            f"--send-test 未发出（运行模式/限速/暂停或适配器失败）。"
+            f" sent={sent} dropped={sender.dropped_count} reason={reason or '无'}。"
+            "本路径计入正式限额，不是白名单豁免。"
+        )
     t = result.timings.as_dict()
     msg = (
         f"status={result.status} ok={result.ok} error={result.error or '无'}；"
-        f"分段耗时 {t}"
+        f"分段耗时 {t}；已计入正式限速配额（非白名单豁免）"
     )
     return result.ok, msg
 
