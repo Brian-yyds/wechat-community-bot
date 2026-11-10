@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Protocol
 
 from src.adapters.base import Event, EventType, Message
 from src.clock import Clock, SystemClock
+from src.latency import LatencyStore, LatencyTrace
 from src.pipeline.classify import Category, Classifier
 from src.pipeline.dedup import Deduplicator
 from src.pipeline.extract import Extraction, Extractor
@@ -20,7 +22,7 @@ from src.pipeline.sink import JsonlSink
 class ReplySender(Protocol):
     """管线向外发送自动回复的接口（由拟人发送器实现）。"""
 
-    def submit_auto_reply(self, group_id: str, text: str) -> None:
+    def submit_auto_reply(self, group_id: str, text: str, *, trace: LatencyTrace | None = None) -> None:
         ...
 
 
@@ -37,6 +39,7 @@ class ProcessResult:
     record: dict
     skipped: bool = False
     skip_reason: str | None = None
+    trace: LatencyTrace | None = None
 
 
 class Pipeline:
@@ -54,6 +57,7 @@ class Pipeline:
         sender: ReplySender | None = None,
         clock: Clock | None = None,
         on_result: Callable[[ProcessResult], None] | None = None,
+        latency_store: LatencyStore | None = None,
     ) -> None:
         self.clock = clock or SystemClock()
         self.dedup = dedup or Deduplicator(clock=self.clock)
@@ -65,15 +69,49 @@ class Pipeline:
         self.sink = sink
         self.sender = sender
         self.on_result = on_result
+        self.latency_store = latency_store
 
     def handle_event(self, event: Event) -> ProcessResult | None:
         """作为适配器回调使用；非消息事件会被忽略。"""
         if event.event_type is not EventType.MESSAGE or event.message is None:
             return None
-        return self.process(event.message)
+        # Event.timestamp 视为适配器检出时间。
+        session_open = None
+        if event.extra:
+            if "session_open" in event.extra:
+                session_open = bool(event.extra["session_open"])
+        return self.process(event.message, detected_at=event.timestamp, session_open=session_open)
 
-    def process(self, message: Message) -> ProcessResult:
+    def process(
+        self,
+        message: Message,
+        *,
+        detected_at: datetime | None = None,
+        session_open: bool | None = None,
+    ) -> ProcessResult:
+        now = self.clock.now()
+        detected = detected_at or now
+        if session_open is None and message.extra:
+            if "session_open" in message.extra:
+                session_open = bool(message.extra["session_open"])
+        preview = (message.content or "")[:80]
+        trace = LatencyTrace(
+            message_id=message.message_id,
+            group_id=message.group_id,
+            kind="auto_reply",
+            session_open=session_open,
+            preview=preview,
+            message_at=message.timestamp if isinstance(message.timestamp, datetime) else None,
+            detected_at=detected,
+        )
+        if self.latency_store is not None:
+            self.latency_store.remember(trace)
+
+        decision_started = time.perf_counter()
         if self.dedup.is_duplicate(message):
+            trace.decided_at = self.clock.now()
+            trace.decision_s = time.perf_counter() - decision_started
+            trace.outcome = "duplicate"
             result = ProcessResult(
                 message=message,
                 duplicate=True,
@@ -83,15 +121,19 @@ class Pipeline:
                 reply_text=None,
                 record=self._record(message, duplicate=True),
                 skipped=True,
+                trace=trace,
             )
             self._emit(result)
+            self._flush_trace_if_idle(trace)
             return result
 
         extraction = self.extractor.extract(message)
         category = self.classifier.classify(message)
+        trace.classified_at = self.clock.now()
         skip_reason: str | None = None
         reply_id = None
         reply_text = None
+        queued = False
         guard: GuardDecision = self.reply_guard.inspect(message)
         if not guard.allow:
             skip_reason = guard.reason
@@ -104,8 +146,14 @@ class Pipeline:
                 reply_id = proposal.rule_id or proposal.source
                 reply_text = proposal.text
                 if self.sender is not None:
-                    self.sender.submit_auto_reply(message.group_id, proposal.text)
+                    self._submit_reply(message.group_id, proposal.text, trace)
+                    queued = True
                 self.reply_guard.record_reply(message.group_id, self.clock.now())
+
+        trace.decided_at = self.clock.now()
+        trace.decision_s = time.perf_counter() - decision_started
+        if not queued:
+            trace.outcome = "no_send" if not reply_text else "queued_skipped"
 
         result = ProcessResult(
             message=message,
@@ -124,9 +172,26 @@ class Pipeline:
                 skip_reason=skip_reason,
             ),
             skip_reason=skip_reason,
+            trace=trace,
         )
         self._emit(result)
+        if not queued:
+            self._flush_trace_if_idle(trace)
         return result
+
+    def _submit_reply(self, group_id: str, text: str, trace: LatencyTrace) -> None:
+        """向发送器提交自动回复；兼容不接受 trace 参数的实现。"""
+        sender = self.sender
+        if sender is None:
+            return
+        try:
+            sender.submit_auto_reply(group_id, text, trace=trace)
+        except TypeError:
+            sender.submit_auto_reply(group_id, text)  # type: ignore[call-arg]
+
+    def _flush_trace_if_idle(self, trace: LatencyTrace) -> None:
+        if self.latency_store is not None:
+            self.latency_store.write(trace)
 
     def _record(
         self,
