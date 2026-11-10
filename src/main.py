@@ -158,13 +158,22 @@ def build_app(
     mode_force = bool(run_cfg.get("mode_force")) or force_mode not in (None, "")
     if force_mode not in (None, ""):
         mode_raw = force_mode
+        intended_source = "--mode"
+    elif bool(run_cfg.get("mode_force")):
+        intended_source = "mode_force"
+    elif "mode" in run_cfg and mode_raw not in (None, ""):
+        intended_source = "config"
+    else:
+        intended_source = "default"
     try:
         run_mode = parse_run_mode(mode_raw)
     except RunModeError as exc:
-        # 非法配置默认安全：回到 observe 继续只读运行，而不是拒绝启动。
+        # 非法配置默认安全：回到 observe 继续只读运行。
+        # 不得把 mode_force 置为 True，以免覆盖已经生效的状态文件。
         logging.getLogger("wechat_bot").warning("非法运行模式，已回退到 observe: %s", exc)
         run_mode = parse_run_mode("observe")
-        mode_force = True
+        mode_force = False
+        intended_source = "invalid"
     pause_gate = PauseGate(data_dir=data_dir)
     latency_raw = (config.get("pipeline") or {}).get("latency_path")
     latency_path = Path(latency_raw) if latency_raw else (data_dir / LATENCY_JSONL_NAME)
@@ -176,7 +185,14 @@ def build_app(
         pause_gate=pause_gate,
         state_path=data_dir / "run_mode.json",
         config_explicit=mode_force,
+        intended_source=intended_source,
     )
+    logging.getLogger("wechat_bot").info(
+        "运行模式生效：%s（来源：%s）",
+        send_gate.get_mode(),
+        send_gate.describe_source(),
+    )
+    run_mode = send_gate.mode
 
     groups = []
     for raw in config.get("groups") or [{"group_id": "demo-group", "name": "交易会员群演示"}]:
@@ -270,6 +286,7 @@ def build_app(
         "latency_store": latency_store,
         "send_gate": send_gate,
         "run_mode": run_mode,
+        "run_mode_source": send_gate.mode_source,
         "clock": clock,
     }
 
