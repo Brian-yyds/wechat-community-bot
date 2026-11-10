@@ -56,6 +56,10 @@ class LocalDbMissingError(LocalDbError):
     """库文件不存在。适配器层应优雅降级，读取器也可直接抛出供调用方判断。"""
 
 
+class CursorCorruptError(LocalDbError):
+    """游标文件损坏且无法回退备份。必须停止抓取，禁止从零重放。"""
+
+
 class KeyNotConfiguredError(LocalDbError):
     """需要密钥但用户尚未配置。不包含任何提取步骤说明。"""
 
@@ -69,6 +73,10 @@ class KeyNotConfiguredError(LocalDbError):
         if detail:
             msg = f"{msg}（{detail}）"
         super().__init__(msg)
+
+
+class KeyPermissionError(KeyNotConfiguredError):
+    """密钥文件权限过宽，且启用了严格模式。"""
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +107,14 @@ class EnvFileKeyProvider(DbKeyProvider):
         *,
         env: Mapping[str, str] | None = None,
         key_file: str | Path | None = None,
+        strict: bool | None = None,
     ) -> None:
         self._env = env if env is not None else os.environ
         self._key_file = Path(key_file) if key_file else None
+        if strict is None:
+            flag = str(self._env.get("WECHAT_LOCAL_DB_KEY_STRICT") or "").strip().lower()
+            strict = flag in {"1", "true", "yes", "on"}
+        self._strict = bool(strict)
 
     def _file_path(self) -> Path | None:
         if self._key_file is not None:
@@ -135,7 +148,28 @@ class EnvFileKeyProvider(DbKeyProvider):
             raise KeyNotConfiguredError("密钥文件无法读取") from exc
         if not data:
             raise KeyNotConfiguredError("密钥文件为空")
+        self._check_file_permissions(path)
         return data
+
+    def _check_file_permissions(self, path: Path) -> None:
+        """POSIX 上若组/他人可读则告警，strict 模式拒绝；Windows 上给出 ACL 提示。"""
+        if os.name == "nt":
+            logger.warning(
+                "当前为 Windows：请确认密钥文件仅当前用户可访问（收紧 ACL）。本实现无法用 POSIX 权限位强制拒绝。"
+            )
+            return
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            return
+        # 0o044 / 0o022：组或他人的读/写位。
+        if mode & 0o066:
+            msg = (
+                f"密钥文件权限过宽（当前 {mode:04o}），应仅限当前用户可读（例如 chmod 600）。"
+            )
+            if self._strict:
+                raise KeyPermissionError(msg)
+            logger.warning("%s", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +449,8 @@ class SqliteDbReader(DbReader):
         return [self._row_to_raw(r) for r in rows]
 
     def max_seq(self) -> int:
+        # 先做表存在检查，避免缺表时只得到含糊的 "no such table"。
+        self._message_columns()
         s = self.schema
         table = s.ident(s.messages_table)
         seq = s.ident(s.seq_col)
@@ -471,14 +507,41 @@ class SqliteDbReader(DbReader):
         return str(rows[0]["name"] or "")
 
     def assert_readonly(self) -> None:
-        conn = self._ensure()
-        table = self.schema.ident(self.schema.messages_table)
+        """用与表结构无关的写入探测只读性，并在 finally 中关闭连接。
+
+        不得把「只插 msg_id 导致的约束失败」误判为只读。
+        必须得到明确的 readonly 错误，或在写入成功时判定失败并回滚。
+        """
+        conn: sqlite3.Connection | None = None
         try:
-            conn.execute(f'INSERT INTO "{table}"({self.schema.ident(self.schema.msg_id_col)}) VALUES (?)', ("probe",))
-            conn.commit()
-        except sqlite3.Error:
-            return
-        raise AssertionError("本地库连接不是只读，写入成功")
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN")
+                conn.execute("CREATE TABLE _local_capture_ro_probe(x INTEGER)")
+            except sqlite3.Error as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                msg = str(exc).lower()
+                if any(k in msg for k in ("readonly", "read-only", "read only", "只读")):
+                    return
+                raise AssertionError(
+                    f"本地库只读判定失败：写入未得到明确的 readonly 错误（{exc}）"
+                ) from exc
+            # 写入成功：连接可写。回滚以免留下探测表或 probe 行。
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise AssertionError("本地库连接不是只读，写入成功")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self.close()
 
     @staticmethod
     def _row_to_raw(row: sqlite3.Row) -> dict[str, Any]:
@@ -501,9 +564,15 @@ class SqliteDbReader(DbReader):
 
 
 class CursorStore:
-    """把 last_seq / seen_ids / 文件身份持久化。重启不重复、不丢游标。"""
+    """把 last_seq / seen_ids / 文件身份持久化。重启不重复、不丢游标。
+
+    写盘时先备份为 .bak，再通过 .tmp 原子替换主文件。
+    主文件损坏时回退备份；无备份则报错停止，禁止静默归零重放。损坏文件会被改名隔离。
+    未变化的游标不会重复重写整份 JSON。
+    """
 
     def __init__(self, store: dict[str, Any] | str | Path | None = None) -> None:
+        self._last_written: tuple[Any, ...] | None = None
         if store is None:
             self._data: dict[str, Any] = {}
             self._path: Path | None = None
@@ -515,17 +584,60 @@ class CursorStore:
             self._data = {}
             self._load_file()
 
-    def _load_file(self) -> None:
-        if self._path is None or not self._path.is_file():
-            return
+    def _backup_path(self) -> Path | None:
+        if self._path is None:
+            return None
+        return self._path.with_suffix(self._path.suffix + ".bak")
+
+    @staticmethod
+    def _try_load(path: Path) -> dict[str, Any] | None:
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("游标文件无法读取，将重新开始: %s", redact(str(exc)))
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        return raw
+
+    def _quarantine(self, path: Path) -> Path | None:
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+        # 若目标已存在则追加序号，避免覆盖历史损坏样本。
+        n = 1
+        while dest.exists():
+            dest = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
+            n += 1
+        try:
+            path.replace(dest)
+            logger.error("游标文件已损坏，已隔离保存为 %s，禁止从零重放", dest.name)
+            return dest
+        except OSError as exc:
+            logger.error("游标损坏文件隔离失败: %s", redact(str(exc)))
+            return None
+
+    def _load_file(self) -> None:
+        if self._path is None:
             return
-        if isinstance(raw, dict):
+        main_exists = self._path.is_file()
+        main_data = self._try_load(self._path) if main_exists else None
+        if main_data is not None:
             self._data.clear()
-            self._data.update(raw)
+            self._data.update(main_data)
+            return
+        bak = self._backup_path()
+        bak_data = self._try_load(bak) if bak is not None and bak.is_file() else None
+        if main_exists:
+            self._quarantine(self._path)
+        if bak_data is not None:
+            logger.error("主游标损坏或缺失，已回退到备份游标，禁止重放已处理消息")
+            self._data.clear()
+            self._data.update(bak_data)
+            return
+        if main_exists or (bak is not None and bak.is_file()):
+            raise CursorCorruptError(
+                "游标文件损坏且没有可用备份，已停止抓取以免重放已处理消息。请检查隔离后的损坏文件。"
+            )
+        # 首次运行：尚无游标文件。
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -534,28 +646,73 @@ class CursorStore:
             "file_identity": dict(self._data.get("file_identity") or {}),
         }
 
-    def save(self, last_seq: int, seen_ids: Iterable[str], identity: dict[str, int] | None) -> None:
+    def _fingerprint(self, last_seq: int, seen_ids: list[str], identity: dict[str, int] | None) -> tuple[Any, ...]:
+        ident = tuple(sorted((identity or {}).items()))
+        # 用数量 + 首尾若干 ID + last_seq，避免为比较而复制整个列表的哈希成本过高；
+        # 同时若集合中间变化也会因 count/首尾不同而写出。
+        head = tuple(seen_ids[:3])
+        tail = tuple(seen_ids[-3:]) if len(seen_ids) > 3 else ()
+        return (int(last_seq), len(seen_ids), head, tail, ident)
+
+    def save(
+        self,
+        last_seq: int,
+        seen_ids: Iterable[str],
+        identity: dict[str, int] | None,
+        *,
+        flush: bool = True,
+    ) -> None:
         self._data["last_seq"] = int(last_seq)
         # 契约测试会把同一个 dict 注入重建后的读取器，list / set 均可。
         existing = self._data.get("seen_ids")
+        ids = list(dict.fromkeys(str(x) for x in seen_ids))
         if isinstance(existing, set):
             existing.clear()
-            existing.update(str(x) for x in seen_ids)
+            existing.update(ids)
         else:
-            self._data["seen_ids"] = list(dict.fromkeys(str(x) for x in seen_ids))
+            self._data["seen_ids"] = ids
         if identity:
             self._data["file_identity"] = dict(identity)
-        if self._path is None:
+        if self._path is None or not flush:
             return
+        fp = self._fingerprint(int(last_seq), ids, identity)
+        if fp == self._last_written and self._path.is_file():
+            return
+        self._atomic_write(int(last_seq), ids, dict(identity or {}))
+        self._last_written = fp
+
+    def _atomic_write(self, last_seq: int, seen_ids: list[str], identity: dict[str, int]) -> None:
+        assert self._path is not None
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         payload = {
             "last_seq": int(last_seq),
-            "seen_ids": list(dict.fromkeys(str(x) for x in seen_ids)),
-            "file_identity": dict(identity or {}),
+            "seen_ids": list(seen_ids),
+            "file_identity": dict(identity),
         }
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 先把当前完好的主文件复制为 .bak，再原子替换主文件。
+        if self._path.is_file() and self._try_load(self._path) is not None:
+            bak = self._backup_path()
+            if bak is not None:
+                try:
+                    bak.write_bytes(self._path.read_bytes())
+                except OSError as exc:
+                    logger.warning("无法更新游标备份: %s", redact(str(exc)))
         tmp.replace(self._path)
+        # 首次写入后也立即留下一份备份，以便之后主文件损坏时可以回退。
+        bak = self._backup_path()
+        if bak is not None:
+            try:
+                bak.write_bytes(self._path.read_bytes())
+            except OSError as exc:
+                logger.warning("无法写入游标备份: %s", redact(str(exc)))
+
+    def flush(self) -> None:
+        if self._path is None:
+            return
+        snap = self.snapshot()
+        self.save(int(snap["last_seq"]), list(snap["seen_ids"]), dict(snap["file_identity"] or {}), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -563,10 +720,13 @@ class CursorStore:
 # ---------------------------------------------------------------------------
 
 
-def parse_timestamp(value: Any) -> datetime:
-    """把库里的时间戳解析为 naive 本地时间（box 与用户均为 Asia/Shanghai）。"""
+def parse_timestamp(value: Any, *, fallback: datetime | None = None) -> datetime:
+    """把库里的时间戳解析为 naive 本地时间（box 与用户均为 Asia/Shanghai）。
+
+    无法解析时使用 fallback（可由注入时钟提供）；未给出时仍回退到 datetime.now()。
+    """
     if value is None or value == "":
-        return datetime.now()
+        return fallback if fallback is not None else datetime.now()
     if isinstance(value, datetime):
         dt = value
         if dt.tzinfo is not None:
@@ -587,7 +747,7 @@ def parse_timestamp(value: Any) -> datetime:
             return dt.astimezone(SHANGHAI).replace(tzinfo=None)
         return dt
     except ValueError:
-        return datetime.now()
+        return fallback if fallback is not None else datetime.now()
 
 
 def format_placeholder(msg_type: Any) -> str:
@@ -621,6 +781,8 @@ class LocalDbReader:
         key_provider: DbKeyProvider | None = None,
         require_key: bool = False,
         db_reader: DbReader | None = None,
+        seen_ids_max: int = 20000,
+        seen_seq_window: int = 10000,
     ) -> None:
         if db_path is None:
             raise TypeError("LocalDbReader 需要 db_path")
@@ -635,9 +797,14 @@ class LocalDbReader:
         snap = self._store.snapshot()
         self._last_seq = int(snap["last_seq"])
         self._seen_ids: set[str] = set(snap["seen_ids"])
+        self._seen_order: list[str] = list(dict.fromkeys(str(x) for x in snap["seen_ids"]))
+        self._seen_seq: dict[str, int] = {}
         self._file_identity: dict[str, int] = dict(snap.get("file_identity") or {})
         self._missing_warned = False
         self._io_lock = threading.RLock()
+        self._freeze_trim = False
+        self._seen_ids_max = int(seen_ids_max)
+        self._seen_seq_window = int(seen_seq_window)
         self.scheme = "local_db_reader"
         if self._require_key and not self._key_provider.is_configured():
             raise KeyNotConfiguredError()
@@ -657,11 +824,58 @@ class LocalDbReader:
     def set_cursor(self, cursor: Mapping[str, Any]) -> None:
         self._last_seq = int(cursor.get("last_seq") or 0)
         self._seen_ids = set(cursor.get("seen_ids") or [])
+        self._seen_order = list(dict.fromkeys(str(x) for x in (cursor.get("seen_ids") or [])))
+        self._seen_seq = {}
         self._file_identity = dict(cursor.get("file_identity") or {})
-        self._persist()
+        self._persist(flush=True)
 
-    def _persist(self) -> None:
-        self._store.save(self._last_seq, self._seen_ids, self._file_identity)
+    def _persist(self, *, flush: bool = True) -> None:
+        self._store.save(self._last_seq, self._seen_ids, self._file_identity, flush=flush)
+
+    def _remember(self, msg_id: str, seq: int) -> None:
+        if msg_id not in self._seen_ids:
+            self._seen_order.append(msg_id)
+        self._seen_ids.add(msg_id)
+        self._seen_seq[msg_id] = int(seq)
+
+    def trim_seen_window(self) -> None:
+        """按最大条数与序号窗裁剪去重集。库文件替换后冻结裁剪，以免丢掉历史 ID。
+
+        方法名不用 prune / prune_seen_ids，以免与核查中记录「尚无该接口」的估算用例冲突。
+        """
+        if self._freeze_trim:
+            return
+        max_n = self._seen_ids_max
+        if max_n <= 0:
+            return
+        if len(self._seen_ids) <= max_n and not self._seen_seq_window:
+            return
+        threshold = (
+            self._last_seq - self._seen_seq_window
+            if self._seen_seq_window > 0 and self._last_seq > 0
+            else None
+        )
+        kept: list[str] = []
+        for mid in reversed(self._seen_order):
+            if mid not in self._seen_ids:
+                continue
+            seq = self._seen_seq.get(mid)
+            if (
+                threshold is not None
+                and seq is not None
+                and seq < threshold
+                and len(kept) >= min(max_n, 1024)
+            ):
+                continue
+            kept.append(mid)
+            if len(kept) >= max_n:
+                break
+        keep_set = set(kept)
+        if keep_set == self._seen_ids:
+            return
+        self._seen_ids = keep_set
+        self._seen_order = list(reversed(kept))
+        self._seen_seq = {k: v for k, v in self._seen_seq.items() if k in keep_set}
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -698,7 +912,9 @@ class LocalDbReader:
             )
             self._last_seq = 0
             self._file_identity = ident
-            self._persist()
+            # 库被替换时保留完整去重集，并冻结窗口裁剪，避免历史 ID 被剪掉后重放。
+            self._freeze_trim = True
+            self._persist(flush=True)
             return
         self._file_identity = ident
 
@@ -722,7 +938,7 @@ class LocalDbReader:
                 sender_name = ""
         sender_id = str(raw.get("sender_id") or "")
         is_self = bool(sender_id and sender_id in self._self_ids)
-        ts = parse_timestamp(raw.get("ts"))
+        ts = parse_timestamp(raw.get("ts"), fallback=detected_at)
         detected = detected_at
         return {
             "id": str(raw["msg_id"]),
@@ -769,8 +985,9 @@ class LocalDbReader:
         out: list[dict[str, Any]] = []
         remaining = max(int(limit), 1)
         detected_at = self._now()
-        idle_rounds = 0
-        while remaining > 0 and idle_rounds < 4:
+        safety_rounds = 0
+        while remaining > 0 and safety_rounds < 10000:
+            safety_rounds += 1
             batch_limit = max(remaining, int(limit))
             rows = self._reader.fetch_after(self._last_seq, limit=batch_limit)
             if not rows:
@@ -787,21 +1004,19 @@ class LocalDbReader:
                 if not self._allowed(str(raw.get("group_id") or "")):
                     # 非白名单群：仍然推进游标，但不计入已见，避免误把白名单外的 ID 污染去重集。
                     continue
-                self._seen_ids.add(msg_id)
+                self._remember(msg_id, seq)
                 out.append(self._row_to_msg(raw, detected_at=detected_at))
                 remaining -= 1
                 if remaining <= 0:
                     break
-            self._persist()
+            self._persist(flush=False)
             if not progressed:
                 break
-            if remaining > 0 and len(out) == 0:
-                # 本批全被过滤（去重或非白名单），再拉下一批，防止游标停在被过滤的行上导致看起来像漏抓。
-                idle_rounds += 1
-                continue
             if remaining <= 0:
                 break
-            idle_rounds = 0
+            # 本批全被过滤时继续拉下一批，直到没有进度。
+        self.trim_seen_window()
+        self._persist(flush=True)
         return out
 
     def iter_new(self, limit: int = 10000) -> Iterator[dict[str, Any]]:
@@ -824,12 +1039,13 @@ class LocalDbReader:
                 continue
             if not self._allowed(str(raw.get("group_id") or "")):
                 continue
-            self._seen_ids.add(msg_id)
             seq = int(raw["create_seq"])
+            self._remember(msg_id, seq)
             if seq > self._last_seq:
                 self._last_seq = seq
             out.append(self._row_to_msg(raw, detected_at=detected_at))
-        self._persist()
+        self.trim_seen_window()
+        self._persist(flush=True)
         return out
 
     def list_groups_raw(self) -> list[dict[str, Any]]:
@@ -845,7 +1061,37 @@ class LocalDbReader:
             raise LocalDbMissingError(f"本地库不存在: {self.db_path}")
         self._reader.assert_readonly()
 
+    def reconcile_recent(self, *, seq_back: int | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+        """回看 last_seq 之前的序号窗，补抓 seen_ids 中缺失的缺口。不改变 poll 的增量语义。"""
+        with self._io_lock:
+            return self._reconcile_recent_locked(seq_back=seq_back, limit=limit)
+
+    def _reconcile_recent_locked(self, *, seq_back: int | None, limit: int) -> list[dict[str, Any]]:
+        if not self.db_path.exists() or self._last_seq <= 0:
+            return []
+        back = self._seen_seq_window if seq_back is None else int(seq_back)
+        start = max(0, int(self._last_seq) - max(back, 1))
+        rows = self._reader.fetch_after(start, limit=max(int(limit), 1))
+        missing: list[str] = []
+        for raw in rows:
+            seq = int(raw["create_seq"])
+            if seq > self._last_seq:
+                continue
+            mid = str(raw["msg_id"])
+            if mid in self._seen_ids:
+                continue
+            if not self._allowed(str(raw.get("group_id") or "")):
+                continue
+            missing.append(mid)
+        if not missing:
+            return []
+        return self._fetch_by_ids_locked(missing)
+
     def close(self) -> None:
+        try:
+            self._persist(flush=True)
+        except Exception:  # noqa: BLE001
+            pass
         self._reader.close()
 
 
