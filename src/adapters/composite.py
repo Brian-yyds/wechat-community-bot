@@ -88,8 +88,25 @@ class CompositeAdapter(Adapter):
         self.inbound.stop()
         self.outbound.stop()
 
-    def send_text(self, group_id: str, text: str) -> None:
-        self.outbound.send_text(group_id, text)
+    def send_text(self, group_id: str, text: str, *args, **kwargs) -> None:
+        """把 send_id / through_official 等正式出口参数转给 outbound，避免组合层丢弃闸门信息。"""
+        self.outbound.send_text(group_id, text, *args, **kwargs)
+
+    @property
+    def last_result(self):
+        outbound = self.outbound
+        result = getattr(outbound, "last_result", None)
+        if result is None:
+            inner = getattr(outbound, "adapter", None)
+            if inner is not None:
+                result = getattr(inner, "last_result", None)
+        return result
+
+    def attach_official_sender(self, sender: object) -> None:
+        """把正式发送闸门挂到真正的 outbound（及可能的内层适配器）。"""
+        for target in (self.outbound, getattr(self.outbound, "adapter", None)):
+            if target is not None and hasattr(target, "attach_official_sender"):
+                target.attach_official_sender(sender)
 
     def notify_typing(self, group_id: str) -> None:
         self.outbound.notify_typing(group_id)
