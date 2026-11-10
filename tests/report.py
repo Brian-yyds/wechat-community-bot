@@ -19,9 +19,22 @@ FILE_TO_SECTION = {
     "test_classification.py": "识别准确率（CL）",
     "test_latency.py": "回复延迟（LT）",
     "test_scheduler.py": "定时公告（SC）",
-    "test_rate_limit.py": "封号风险（RK）",
+    "test_rate_limit.py": "封号风险 / 限频（RK/RL）",
     "test_security.py": "安全（SEC）",
     "test_forbidden_scan.py": "禁止功能扫描（FB）",
+    "test_adapter_contracts.py": "适配器契约（AD）",
+    "test_autoreply.py": "自动回复正确性（AR）",
+    "test_capture.py": "全量抓取对账（CAP）",
+    "test_adapters.py": "开发单元：MockAdapter",
+    "test_pipeline.py": "开发单元：管线",
+    "test_ratelimit.py": "开发单元：令牌桶",
+    "test_logging_util.py": "开发单元：日志脱敏",
+    "test_demo.py": "开发单元：演示入口",
+    "test_run_mode.py": "运行模式（RM）",
+    "test_hourly_limit.py": "开发单元：小时上限",
+    "test_guards.py": "开发单元：守卫",
+    "test_adapters_composite.py": "开发单元：组合适配器",
+    "test_selfcheck.py": "开发单元：自检脚本",
 }
 
 
@@ -167,10 +180,22 @@ def main():
             "不代表产品已通过验收。开发交付后请用 `./run_all.sh real` 复测。"
         )
     else:
-        lines.append("请按下列失败用例修复后通知核查复测：")
+        lines.append("请按下列失败用例修复后通知核查复测（含文件与现象）：")
         for r in by["failed"]:
             fn = _case_file(r["nodeid"])
-            lines.append(f"- [{FILE_TO_SECTION.get(fn, fn)}] `{r['nodeid']}`")
+            detail = (r.get("longrepr") or "").strip()
+            phenomenon = ""
+            for ln in detail.splitlines():
+                s = ln.strip()
+                if s.startswith("E ") or s.startswith("AssertionError") or "断言" in s or s.startswith("E\t"):
+                    phenomenon = s[2:].strip() if s.startswith("E ") else s
+                    if len(phenomenon) > 220:
+                        phenomenon = phenomenon[:220] + "…"
+                    break
+            if not phenomenon and detail:
+                phenomenon = detail.splitlines()[-1][:220]
+            extra = f"：{phenomenon}" if phenomenon else ""
+            lines.append(f"- [{FILE_TO_SECTION.get(fn, fn)}] `{r['nodeid']}`{extra}")
         lines.append("")
         lines.append("修复要求：不得为通过测试而放宽禁止功能边界；不得把负向用例做成功能。")
     lines.append("")
@@ -189,6 +214,9 @@ def main():
         "建议开发在根 `.gitignore` 增加 `!tests/data/` 与 `!tests/data/**`；当前可用 `git add -f tests/data/*.jsonl`。"
     )
     lines.append("- 禁止功能扫描若有命中，除退回修复外须立即报告智哥。")
+    lines.append(
+        "- Windows 人工实测与 7–14 天观察记录见 `WINDOWS_MANUAL_TEST.md` 与 `observation_log.csv`，不在本次自动化范围内。"
+    )
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote {REPORT}  overall={overall}  pass={n_pass} fail={n_fail} skip={n_skip}")
     return 0 if n_fail == 0 else 1

@@ -2,6 +2,9 @@
 
 本目录是「交易会员群」本地微信群机器人的核查测试资产。产品功能仅四项：实时监控群消息、群消息整理识别、自动回复、定时公告。
 
+主路线：官方 PC 微信 + 本地库增量只读 + UIA 限频发送；C 通知辅助、D OCR 降级。不做 Hook / 非官方协议号。
+封号相关只验限频合规与观察记录，**不承诺不封号**。
+
 **严禁**博彩、六合彩、下注、结算、收款及相关功能。`data/negative_forbidden.jsonl` 中的相关内容只作为「必须拒绝并上报」的负向用例，**不是**需求。
 
 不在此目录创建任何轮询或定时例程。测试按需手动执行。
@@ -42,6 +45,10 @@ BOT_TEST_USE_MOCK=1 python3 -m pytest -c pytest.ini
 | --- | --- |
 | `BOT_TEST_USE_MOCK=1` | 使用 `tests/mock` 跑通用例逻辑 |
 | `BOT_ADAPTER_MODULE=src.bot_api` | 指定开发模块路径 |
+| `BOT_TEST_LATENCY_OPEN_P95` | 规则回复且会话已打开的端到端 P95 目标（默认 3） |
+| `BOT_TEST_LATENCY_OTHER_P95` | 其余场景端到端 P95 目标（默认 8） |
+| `BOT_TEST_HUMANIZE_OPEN_MIN` / `_MAX` | 打开会话短拟人区间（默认 1.0–2.2） |
+| `BOT_TEST_HUMANIZE_DEFAULT_MIN` / `_MAX` | 默认拟人区间（默认 2–6，对 8s 路径） |
 
 长时稳定性（24h/72h 内存与句柄）不在默认 pytest 门禁里，按 `ACCEPTANCE.md` 的 ST-05/ST-06/ST-07 在预发执行。
 
@@ -82,12 +89,14 @@ python3 generators/generate_load.py mixed --n 300
 3. **发送层** `Sender.send(group, text, *, kind=...)`，测试可替换为记录型 mock，不触达真实微信。
 
 4. **限流** `RateLimiter.allow / record / next_delay / in_night_silence`  
-   单群与全局限频同时生效；夜间静默不主动发公告；同内容冷却；`next_delay` 带抖动。
+   单群与全局限频同时生效；默认全局 40 条/小时（可配）；超限自动回复降级为不回；夜间静默不主动发公告；同内容冷却；`next_delay` 带抖动。
 
-5. **拟人延迟** `humanize_delay_range() -> (下限秒, 上限秒)`  
-   须满足 `1.5 ≤ 下限 < 上限 ≤ 8`，且与端到端 P95 ≤ 12 秒相容。建议区间 2～6 秒。
+5. **拟人延迟** `humanize_delay_range(path=None) -> (下限秒, 上限秒)`  
+   默认路径（其余场景，P95 目标 8s）建议 2～6 秒。`path='open_session_rule'` 为打开会话的规则回复提供短区间（建议 1.0–2.2s），与 P95 目标 3s 相容。默认 2–6s 与 3s 目标冲突，不能混用。阈值可配。另建议提供 `humanize_delay(text, rng=, path=)`。
 
 6. **日志脱敏** `redact_log(line) -> str`：掩码手机号、微信号、wxid、token。
+
+7. **运行模式** `RunModeController`：`observe`（只收不发）、`announce`（只发公告）、`reply`（才自动回复）。提供 `get_mode` / `set_mode` / `allow_auto_reply` / `allow_announcement`，状态可放入 store，切换立即生效，重启保持。
 
 模块缺失时测试会 skip 并写明原因。安全扫描与禁止功能扫描不依赖模块，会直接扫描 `src/`、`config/`、`templates/` 等。
 
@@ -98,7 +107,11 @@ python3 generators/generate_load.py mixed --n 300
 | 路径 | 说明 |
 | --- | --- |
 | `ACCEPTANCE.md` | 验收清单与测试方案 |
+| `WINDOWS_MANUAL_TEST.md` | 用户 Windows 人工实测清单（不承诺不封号） |
+| `observation_log.csv` | 7–14 天观察记录表模板 |
 | `adapter.py` | 适配层 |
+| `contracts/` | 各方案适配器契约套件 |
+| `sim/` | 模拟微信本地库与对账 |
 | `data/messages.jsonl` | ≥120 条虚构群消息 |
 | `data/negative_forbidden.jsonl` | 禁止功能负向用例 |
 | `data/build_dataset.py` | 数据集生成脚本 |

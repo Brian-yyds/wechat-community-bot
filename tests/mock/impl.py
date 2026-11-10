@@ -20,6 +20,10 @@ from constants import (
     GROUP_HOURLY_LIMIT_DEFAULT,
     HOURLY_LIMIT_DEFAULT,
     HUMANIZE_DEFAULT,
+    HUMANIZE_OPEN_SESSION_DEFAULT,
+    LATENCY_DETECT_DECIDE_BUDGET,
+    LATENCY_OPEN_SESSION_RULE_P95,
+    LATENCY_OTHER_P95,
     NIGHT_SILENCE,
     TYPING_CHARS_PER_SECOND,
     TYPING_DELAY_MAX,
@@ -284,25 +288,38 @@ class Scheduler:
 # 限流 / 拟人化 / 发送
 # ---------------------------------------------------------------------------
 
-def humanize_delay_range():
+def humanize_delay_range(path: str | None = None):
+    """返回拟人区间。path=open_session_rule 使用与 3s 目标相容的短区间。"""
+    if path in {"open_session_rule", "rule_open", "open"}:
+        return HUMANIZE_OPEN_SESSION_DEFAULT
     return HUMANIZE_DEFAULT
 
 
-def humanize_delay(text: str = "", *, rng: Optional[random.Random] = None) -> float:
-    """拟人延迟：基础抖动 + 按文本长度的打字时间。不真实 sleep，可注入随机源。"""
+def humanize_delay(text: str = "", *, rng: Optional[random.Random] = None, path: str | None = None) -> float:
+    """拟人延迟：基础抖动 + 按文本长度的打字时间。不真实 sleep，可注入随机源与路径。"""
     rng = rng or random.Random()
-    lo, hi = humanize_delay_range()
+    lo, hi = humanize_delay_range(path)
     base = rng.uniform(lo, hi)
     extra = min(TYPING_DELAY_MAX, (len(text or "") / TYPING_CHARS_PER_SECOND) * 0.25)
-    return min(base + extra, hi + TYPING_DELAY_MAX)
+    # 打开会话短区间已按 3s 目标定上限，打字时间须含在区间内，不得再叠出预算。
+    cap = hi if path in {"open_session_rule", "rule_open", "open"} else min(hi + TYPING_DELAY_MAX, hi + 2.0)
+    return min(base + extra, cap)
 
 
-def validate_latency_config(p95_max: float = 12.0, process_budget: float = 2.0):
-    lo, hi = humanize_delay_range()
-    if not (1.5 <= lo < hi <= 8.0):
+def validate_latency_config(p95_max: float | None = None, process_budget: float | None = None, path: str | None = None):
+    """校验拟人区间与对应路径的 P95 目标相容。默认路径对「其余 8s」，open_session_rule 对 3s。"""
+    lo, hi = humanize_delay_range(path)
+    floor = 0.8
+    if not (floor <= lo < hi <= 8.0):
         raise ValueError(f"拟人化区间非法: {(lo, hi)}")
-    if hi + process_budget > p95_max:
-        raise ValueError("拟人化上限与 P95 目标不相容")
+    budget = LATENCY_DETECT_DECIDE_BUDGET if process_budget is None else process_budget
+    target = p95_max
+    if target is None:
+        target = LATENCY_OPEN_SESSION_RULE_P95 if path in {"open_session_rule", "rule_open", "open"} else LATENCY_OTHER_P95
+    if hi + budget > target + 1e-9:
+        raise ValueError(
+            f"拟人上限 {hi}s + 检出/决策预算 {budget}s 超过该路径 P95 目标 {target}s（path={path or 'default'}）"
+        )
     return True
 
 
@@ -487,3 +504,40 @@ from mock.adapters import (  # noqa: E402
     UiaSendStatus,
 )
 from mock.autoreply import AutoReplyService, ReplyDecision  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 运行模式：observe / announce / reply
+# ---------------------------------------------------------------------------
+
+class RunModeController:
+    """observe 只收不发；announce 只发公告；reply 才自动回复。状态可放入 store，重启保持。"""
+
+    MODES = ("observe", "announce", "reply")
+
+    def __init__(self, store=None, mode: str = "observe"):
+        self.store = store if store is not None else {}
+        if "run_mode" not in self.store:
+            self.store["run_mode"] = mode
+        self.set_mode(self.store["run_mode"])
+
+    def get_mode(self) -> str:
+        return self.store.get("run_mode", "observe")
+
+    def set_mode(self, mode: str) -> str:
+        mode = str(mode or "").strip().lower()
+        if mode not in self.MODES:
+            raise ValueError(f"未知运行模式 {mode!r}，应为 {self.MODES}")
+        self.store["run_mode"] = mode
+        return mode
+
+    def allow_auto_reply(self) -> bool:
+        return self.get_mode() == "reply"
+
+    def allow_announcement(self) -> bool:
+        return self.get_mode() in {"announce", "reply"}
+
+    def allow_send(self, kind: str = "reply") -> bool:
+        if kind == "announcement":
+            return self.allow_announcement()
+        return self.allow_auto_reply()

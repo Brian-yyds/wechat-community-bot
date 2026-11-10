@@ -355,3 +355,83 @@ def test_sc06_invalid_window_rejected():
         _make_contract(clock=clock, window=CATCH_UP_WINDOW_MAX + 100)
     with pytest.raises((ValueError, TypeError, AssertionError)):
         _make_contract(clock=clock, window=-1)
+
+
+
+# ---------------------------------------------------------------------------
+# 公告准点补充（SC-07～SC-10）：时区 Asia/Shanghai、跨月、掉线/重启只补一次。
+# ---------------------------------------------------------------------------
+
+
+def test_sc07_timezone_is_shanghai():
+    """SC-07 计划时区按 Asia/Shanghai（中国无夏令时，但必须带 +08:00，不能当 UTC）。"""
+    from datetime import datetime, timedelta
+    # 若把 16:00 +08:00 误当成 UTC，会错 8 小时
+    run_at = datetime(2026, 11, 11, 16, 0, 0, tzinfo=_SHANGHAI)
+    clock = _contract_clock(run_at - timedelta(seconds=10))
+    sch = _make_contract(clock=clock)
+    sch.add_announcement("job-tz", "时区检查-虚构", run_at, "交易会员群-主群")
+    assert sch.tick() == []
+    clock.set(run_at + timedelta(seconds=2))
+    due = sch.tick()
+    assert len(due) == 1, "Asia/Shanghai 16:00 应在本地 16:00:02 触发，而不是按 UTC 计算"
+    sch.mark_sent("job-tz", clock.now())
+    # 8 小时后不应再当成「到点」
+    clock.set(run_at + timedelta(hours=8))
+    assert sch.tick() == []
+
+
+def test_sc08_cross_month_boundary():
+    """SC-08 跨月 23:59 → 次月 00:00 只触发一次。"""
+    from datetime import datetime, timedelta
+    before = datetime(2026, 11, 30, 23, 59, 50, tzinfo=_SHANGHAI)
+    run_at = datetime(2026, 12, 1, 0, 0, 0, tzinfo=_SHANGHAI)
+    clock = _contract_clock(before)
+    sch = _make_contract(clock=clock)
+    sch.add_announcement("job-month", "跨月公告-虚构", run_at, "交易会员群-主群")
+    assert sch.tick() == []
+    clock.set(run_at + timedelta(seconds=2))
+    due = sch.tick()
+    assert len(due) == 1
+    sch.mark_sent("job-month", clock.now())
+    clock.set(run_at + timedelta(minutes=30))
+    assert sch.tick() == []
+    assert sch.on_recover() == []
+
+
+def test_sc09_disconnect_then_restart_catch_up_only_once():
+    """SC-09 掉线跨越 run_at，恢复后再模拟重启，窗口内只补一次。"""
+    from datetime import datetime, timedelta
+    run_at = datetime(2026, 11, 11, 20, 0, 0, tzinfo=_SHANGHAI)
+    store = {}
+    clock = _contract_clock(run_at - timedelta(seconds=30))
+    sch = _make_contract(clock=clock, store=store)
+    sch.add_announcement("job-once", "只补一次-虚构", run_at, "交易会员群-主群")
+    # 掉线跨越 run_at
+    clock.set(run_at + timedelta(minutes=4))
+    recovered = sch.on_recover()
+    assert len(recovered) == 1
+    sch.mark_sent("job-once", clock.now())
+    # 再次恢复 + 新进程
+    clock2 = _contract_clock(run_at + timedelta(minutes=6))
+    sch2 = _make_contract(clock=clock2, store=store)
+    assert sch2.on_recover() == []
+    assert sch2.tick() == []
+    assert sch2.on_recover() == []
+
+
+def test_sc10_no_dst_but_spring_forward_date_still_stable():
+    """SC-10 中国无夏令时：即便经过「其他时区会调时」的日期，Asia/Shanghai 仍按 +08:00 稳定触发。"""
+    from datetime import datetime, timedelta
+    # 2026-03-08 是美国春令起始日，上海不应跳小时
+    run_at = datetime(2026, 3, 8, 2, 30, 0, tzinfo=_SHANGHAI)
+    clock = _contract_clock(run_at - timedelta(minutes=1))
+    sch = _make_contract(clock=clock)
+    sch.add_announcement("job-dst", "无夏令时-虚构", run_at, "交易会员群-主群")
+    clock.set(run_at + timedelta(seconds=1))
+    due = sch.tick()
+    assert len(due) == 1
+    job_run = due[0].run_at if hasattr(due[0], "run_at") else due[0]["run_at"]
+    assert job_run.utcoffset() == timedelta(hours=8) or job_run.tzinfo is None
+    sch.mark_sent("job-dst", clock.now())
+    assert sch.tick() == []

@@ -149,3 +149,166 @@ def test_rk01_protocol_self_report(repo_root):
         "已有源码但未找到协议自报。请在 docs/PROTOCOL.md 或配置 wechat.protocol "
         "写明实际微信协议/框架（Hook、Web、iPad、Windows/Mac 等）及已知风险。"
     )
+
+
+# ---------------------------------------------------------------------------
+# 每小时上限（RL-01～RL-06）：默认 40 条/小时，滑动窗口，重启保持，与拟人延迟相容。
+# 超限策略（已写入 ACCEPTANCE.md）：自动回复降级为不回（drop），不排队。
+# ---------------------------------------------------------------------------
+
+
+def _limiter(**kwargs):
+    impl = require_impl("RateLimiter")
+    return impl.RateLimiter(**kwargs)
+
+
+def test_rl01_default_hourly_cap_is_40():
+    """RL-01 默认（或可配）全局每小时上限为 40。"""
+    impl = require_impl("RateLimiter")
+    limiter = impl.RateLimiter(group_per_minute=100, global_per_minute=100)
+    cap = getattr(limiter, "global_per_hour", None)
+    if cap is None:
+        pytest.fail(
+            "RateLimiter 未实现每小时上限（期望属性 global_per_hour，默认 40）。"
+            "请在 src/bot_api.RateLimiter 增加滑动窗口全局 40 条/小时（可配）与单群上限。"
+            "超限时自动回复应降级为不回（drop），不要排队。"
+        )
+    assert cap == 40 or cap <= 40, f"默认每小时上限应为 40，实际 {cap}"
+
+
+def test_rl02_over_limit_is_dropped():
+    """RL-02 超过每小时上限后不再放行（降级为不回，不排队爆发）。"""
+    limiter = _limiter(
+        group_per_minute=200,
+        global_per_minute=200,
+        global_per_hour=40,
+        group_per_hour=40,
+        content_cooldown_seconds=0,
+    )
+    now = datetime(2026, 11, 11, 10, 0, 0, tzinfo=SHANGHAI)
+    allowed = 0
+    for i in range(50):
+        h = f"hr-{i}"
+        if limiter.allow(group=GROUP_A, content_hash=h, now=now + timedelta(seconds=i), kind="reply"):
+            limiter.record(group=GROUP_A, content_hash=h, now=now + timedelta(seconds=i), kind="reply")
+            allowed += 1
+    assert allowed == 40, f"1 小时窗内应放行 40 条，实际 {allowed}（超限应丢弃/不回，不得放行 41+）"
+    # 再要一条，仍应拒绝
+    assert limiter.allow(group=GROUP_A, content_hash="hr-more", now=now + timedelta(seconds=50), kind="reply") is False
+
+
+def test_rl03_sliding_window_boundary():
+    """RL-03 滑动窗口：恰好满 1 小时后最早一条过期，才能再放行 1 条。不是整点清零。"""
+    limiter = _limiter(
+        group_per_minute=200,
+        global_per_minute=200,
+        global_per_hour=40,
+        group_per_hour=40,
+        content_cooldown_seconds=0,
+    )
+    t0 = datetime(2026, 11, 11, 11, 0, 0, tzinfo=SHANGHAI)
+    for i in range(40):
+        ts = t0 + timedelta(seconds=i)
+        assert limiter.allow(group=GROUP_A, content_hash=f"b-{i}", now=ts, kind="reply")
+        limiter.record(group=GROUP_A, content_hash=f"b-{i}", now=ts, kind="reply")
+    # 1 小时不到：仍拒绝
+    almost = t0 + timedelta(hours=1, seconds=-1)
+    assert limiter.allow(group=GROUP_A, content_hash="b-almost", now=almost, kind="reply") is False
+    # 第一条发出时间 t0 已滑出窗口
+    opened = t0 + timedelta(hours=1, seconds=1)
+    assert limiter.allow(group=GROUP_A, content_hash="b-open", now=opened, kind="reply") is True
+
+
+def test_rl04_cross_hour_is_sliding_not_calendar():
+    """RL-04 跨整点（11:30 的发送在 12:15 仍计入窗口）。"""
+    limiter = _limiter(
+        group_per_minute=200,
+        global_per_minute=200,
+        global_per_hour=2,
+        group_per_hour=2,
+        content_cooldown_seconds=0,
+    )
+    t1 = datetime(2026, 11, 11, 11, 30, 0, tzinfo=SHANGHAI)
+    t2 = datetime(2026, 11, 11, 11, 50, 0, tzinfo=SHANGHAI)
+    assert limiter.allow(group=GROUP_A, content_hash="x1", now=t1, kind="reply")
+    limiter.record(group=GROUP_A, content_hash="x1", now=t1, kind="reply")
+    assert limiter.allow(group=GROUP_A, content_hash="x2", now=t2, kind="reply")
+    limiter.record(group=GROUP_A, content_hash="x2", now=t2, kind="reply")
+    noon = datetime(2026, 11, 11, 12, 15, 0, tzinfo=SHANGHAI)
+    assert limiter.allow(group=GROUP_A, content_hash="x3", now=noon, kind="reply") is False, (
+        "滑动窗口下 11:30 的发送在 12:15 仍应计入，不得因跨小时而清零"
+    )
+    later = datetime(2026, 11, 11, 12, 31, 0, tzinfo=SHANGHAI)
+    assert limiter.allow(group=GROUP_A, content_hash="x4", now=later, kind="reply") is True
+
+
+def test_rl05_restart_keeps_hourly_window():
+    """RL-05 重启后小时窗口应保持（状态需可持久化到 store）。"""
+    impl = require_impl("RateLimiter")
+    store = {}
+    now = datetime(2026, 11, 11, 16, 0, 0, tzinfo=SHANGHAI)
+    try:
+        a = impl.RateLimiter(
+            group_per_minute=200,
+            global_per_minute=200,
+            global_per_hour=40,
+            group_per_hour=40,
+            content_cooldown_seconds=0,
+            store=store,
+        )
+    except TypeError:
+        pytest.fail(
+            "RateLimiter 构造不接受 store=，重启后小时窗口无法保持。"
+            "请把滑动窗口事件持久化（例如传入共享 store 或落盘），避免重启后再放行 40 条。"
+        )
+    for i in range(40):
+        ts = now + timedelta(seconds=i)
+        assert a.allow(group=GROUP_A, content_hash=f"rs-{i}", now=ts, kind="reply")
+        a.record(group=GROUP_A, content_hash=f"rs-{i}", now=ts, kind="reply")
+    b = impl.RateLimiter(
+        group_per_minute=200,
+        global_per_minute=200,
+        global_per_hour=40,
+        group_per_hour=40,
+        content_cooldown_seconds=0,
+        store=store,
+    )
+    assert b.allow(group=GROUP_A, content_hash="rs-new", now=now + timedelta(seconds=41), kind="reply") is False, (
+        "重启后应仍视为已达 40 条/小时上限"
+    )
+
+
+def test_rl06_global_and_per_group_and_delay_compatible():
+    """RL-06 全局与单群上限同时生效；与拟人延迟相容（在延迟之后仍检查窗口）。"""
+    limiter = _limiter(
+        group_per_minute=200,
+        global_per_minute=200,
+        global_per_hour=5,
+        group_per_hour=3,
+        content_cooldown_seconds=0,
+    )
+    now = datetime(2026, 11, 11, 18, 0, 0, tzinfo=SHANGHAI)
+    # 单群先打满 3
+    for i in range(3):
+        ts = now + timedelta(seconds=i)
+        assert limiter.allow(group=GROUP_A, content_hash=f"ga-{i}", now=ts, kind="reply")
+        limiter.record(group=GROUP_A, content_hash=f"ga-{i}", now=ts, kind="reply")
+    assert limiter.allow(group=GROUP_A, content_hash="ga-x", now=now + timedelta(seconds=3), kind="reply") is False
+    # 另一群还可发，但全局上限 5
+    for i in range(2):
+        ts = now + timedelta(seconds=10 + i)
+        assert limiter.allow(group=GROUP_B, content_hash=f"gb-{i}", now=ts, kind="reply")
+        limiter.record(group=GROUP_B, content_hash=f"gb-{i}", now=ts, kind="reply")
+    assert limiter.allow(group=GROUP_B, content_hash="gb-x", now=now + timedelta(seconds=20), kind="reply") is False
+
+    # 拟人延迟：先拿到 delay，时钟拨到 delay 之后再 allow，窗口判断用发送时刻
+    impl = require_impl("RateLimiter")
+    if hasattr(impl, "humanize_delay"):
+        rng = __import__("random").Random(1)
+        delay = impl.humanize_delay("请问手续费怎么算？", rng=rng)
+    else:
+        delay = limiter.next_delay()
+    assert delay >= 1.5
+    send_at = now + timedelta(seconds=delay)
+    # 此时全局已满，延迟结束后仍应拒绝，避免「先占位再延迟」超发
+    assert limiter.allow(group=GROUP_B, content_hash="after-delay", now=send_at, kind="reply") is False

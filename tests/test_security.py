@@ -227,3 +227,48 @@ def test_sec07_sensitive_file_permissions(repo_root):
         if mode & 0o004:
             bad.append(f"{p} mode={oct(p.stat().st_mode)}")
     assert not bad, "敏感文件对 others 可读: " + ", ".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 日志脱敏补充（SEC-04b）：wxid、手机号、多段 token、微信号、群名可选。
+# ---------------------------------------------------------------------------
+
+
+def test_sec04b_phone_wxid_wechat_id_and_multipart_token():
+    """SEC-04 补充：手机号、wxid、微信号、多段 token 均不得完整落地。"""
+    impl = require_impl("redact_log")
+    phone = impl.redact_log("备份手机 13912345678 与 15800001111")
+    assert "13912345678" not in phone
+    assert "15800001111" not in phone
+
+    wxid = impl.redact_log("发送者 wxid_abcDEF-123_xx 进入群聊")
+    assert "wxid_abcDEF-123_xx" not in wxid, f"带连字符/下划线的 wxid 未被脱敏: {wxid!r}"
+
+    wechat = impl.redact_log("微信号：DemoWeiXin_01 请核对")
+    assert "DemoWeiXin_01" not in wechat, f"微信号未被脱敏: {wechat!r}"
+
+    jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaaPayloadBBB.sigCCC999"
+    tok = impl.redact_log(f"access_token={jwt} ok")
+    assert jwt not in tok, f"多段 JWT token 完整出现在日志: {tok!r}"
+    assert "aaaPayloadBBB" not in tok
+    assert "sigCCC999" not in tok
+
+    spaced = impl.redact_log("refresh_token v1.seg2.seg3 leftover")
+    assert "v1.seg2.seg3" not in spaced, f"空格分隔的多段 token 未被脱敏: {spaced!r}"
+    assert "leftover" in spaced
+
+
+def test_sec04c_group_name_redaction_optional():
+    """SEC-04 群名脱敏为可选项：若接口支持 group_names，则必须掩码。"""
+    import inspect
+
+    impl = require_impl("redact_log")
+    line = "群「交易会员群-主群」收到消息"
+    sig = inspect.signature(impl.redact_log)
+    if "group_names" in sig.parameters:
+        out = impl.redact_log(line, group_names=["交易会员群-主群"])
+        assert "交易会员群-主群" not in out, f"已请求群名脱敏但仍出现: {out!r}"
+    else:
+        # 可选能力，未实现不判失败
+        out = impl.redact_log(line)
+        assert isinstance(out, str)

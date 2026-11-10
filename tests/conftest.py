@@ -67,3 +67,48 @@ def messages() -> list[dict]:
 @pytest.fixture
 def negative_messages() -> list[dict]:
     return _load_jsonl(_TESTS_DIR / "data" / "negative_forbidden.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# 把本次 pytest 结果写入 .last_results.json，供 report.py 汇总。
+# ---------------------------------------------------------------------------
+
+_SESSION_RESULTS: list[dict] = []
+
+
+def pytest_runtest_logreport(report):
+    """记录 call 阶段结果；setup/teardown 的 skip 与 error 也要记，避免漏计。"""
+    if report.when == "call":
+        _SESSION_RESULTS.append(
+            {
+                "nodeid": report.nodeid,
+                "outcome": report.outcome,
+                "when": report.when,
+                "longrepr": str(report.longrepr) if report.longrepr is not None else "",
+            }
+        )
+        return
+    if report.when == "setup" and report.outcome in {"skipped", "failed"}:
+        _SESSION_RESULTS.append(
+            {
+                "nodeid": report.nodeid,
+                "outcome": "skipped" if report.outcome == "skipped" else "failed",
+                "when": report.when,
+                "longrepr": str(report.longrepr) if report.longrepr is not None else "",
+            }
+        )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    import json
+    from adapter import use_mock
+
+    payload = {
+        "exitstatus": int(exitstatus),
+        "use_mock": bool(use_mock()),
+        "repo_root": str(_REPO_ROOT),
+        "results": _SESSION_RESULTS,
+    }
+    out = _TESTS_DIR / ".last_results.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+

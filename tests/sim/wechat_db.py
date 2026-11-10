@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(msg_id);
 CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages(group_id, ts);
+CREATE TABLE IF NOT EXISTS sessions (
+    group_id TEXT PRIMARY KEY,
+    name TEXT DEFAULT '',
+    muted INTEGER NOT NULL DEFAULT 0,
+    collapsed INTEGER NOT NULL DEFAULT 0,
+    opened INTEGER NOT NULL DEFAULT 1,
+    dnd INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -240,3 +248,81 @@ class SimulatedWeChatDB:
         """破坏文件头，模拟库损坏。"""
         data = self.path.read_bytes()
         self.path.write_bytes(b"NOTASQLITE" + data[11:])
+
+    def set_session(
+        self,
+        group_id: str,
+        *,
+        name: str = "",
+        muted: bool = False,
+        collapsed: bool = False,
+        opened: bool = True,
+        dnd: bool = False,
+    ) -> None:
+        """登记会话状态：免打扰、折叠、是否打开。本地库仍保留这些会话的消息。"""
+        conn = _connect(self.path)
+        try:
+            conn.execute(
+                "INSERT INTO sessions(group_id, name, muted, collapsed, opened, dnd) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(group_id) DO UPDATE SET "
+                "name=excluded.name, muted=excluded.muted, collapsed=excluded.collapsed, "
+                "opened=excluded.opened, dnd=excluded.dnd",
+                (group_id, name, int(muted), int(collapsed), int(opened), int(dnd)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_session(self, group_id: str) -> dict | None:
+        conn = _connect(self.path, readonly=True)
+        try:
+            row = conn.execute("SELECT * FROM sessions WHERE group_id=?", (group_id,)).fetchone()
+            if row is None:
+                return None
+            return {
+                "group_id": row["group_id"],
+                "name": row["name"],
+                "muted": bool(row["muted"]),
+                "collapsed": bool(row["collapsed"]),
+                "opened": bool(row["opened"]),
+                "dnd": bool(row["dnd"]),
+            }
+        finally:
+            conn.close()
+
+    def seed_session_states(self, start: datetime | None = None) -> list[dict]:
+        """构造免打扰 / 折叠 / 未打开 / 当前打开 四类会话各若干条消息。"""
+        start = start or datetime(2026, 11, 11, 16, 0, 0, tzinfo=SHANGHAI)
+        specs = [
+            ("g-open", "当前打开的群", dict(opened=True, muted=False, collapsed=False, dnd=False)),
+            ("g-muted", "免打扰群", dict(opened=False, muted=True, collapsed=False, dnd=True)),
+            ("g-folded", "会话列表折叠群", dict(opened=False, muted=False, collapsed=True, dnd=False)),
+            ("g-unopened", "从未打开的群", dict(opened=False, muted=False, collapsed=False, dnd=False)),
+        ]
+        planned: list[dict] = []
+        for idx, (gid, name, flags) in enumerate(specs):
+            self.set_session(gid, name=name, **flags)
+            for j in range(5):
+                mid = f"{gid}-m{j}"
+                row = {
+                    "msg_id": mid,
+                    "group_id": gid,
+                    "sender_id": f"u{j}",
+                    "content": f"{name}的消息{j}（虚构）",
+                    "ts": start + timedelta(seconds=idx * 10 + j),
+                    "session": dict(flags, name=name),
+                }
+                self.insert(
+                    msg_id=mid,
+                    group_id=gid,
+                    sender_id=row["sender_id"],
+                    content=row["content"],
+                    ts=row["ts"],
+                )
+                planned.append(row)
+        return planned
+
+    def simulate_wechat_restart(self) -> None:
+        """模拟微信客户端重启：短暂独占库，随后恢复可读写。不清理消息。"""
+        with self.exclusive_lock(hold_seconds=0.08):
+            pass

@@ -155,3 +155,63 @@ def test_cap00_reconcile_helper_detects_errors():
     assert dups.dup_process_rate > 0 and "a" in dups.duplicate_ids
     clean = reconcile(["a", "b"], ["b", "a"])
     assert clean.ok
+
+
+def test_cap05_muted_folded_unopened_not_missed(tmp_path: Path):
+    """CAP-05 免打扰 / 折叠 / 未打开的群，本地库对账仍须漏抓 0（不能只盯当前打开会话）。"""
+    factory = _reader_factory()
+    db = SimulatedWeChatDB(tmp_path / "msg.db")
+    planned = db.seed_session_states()
+    expected = [r["msg_id"] for r in planned]
+    # 确认四类会话都在
+    states = {r["group_id"]: db.get_session(r["group_id"]) for r in planned}
+    assert states["g-muted"]["muted"] and states["g-muted"]["dnd"]
+    assert states["g-folded"]["collapsed"]
+    assert states["g-unopened"]["opened"] is False
+    assert states["g-open"]["opened"] is True
+    reader = _make_reader(factory, db)
+    processed = _drain(reader)
+    report = reconcile(expected, processed)
+    assert report.miss_rate == 0.0, (
+        f"免打扰/折叠/未打开群发生漏抓 {report.missed_ids}。"
+        "本地库只读必须抓取客户端已同步的全部群消息，不能只读当前打开会话。"
+    )
+    assert report.dup_process_rate == 0.0, f"重复处理 {report.duplicate_ids}"
+    # 按群确认
+    by_group = {}
+    for r in planned:
+        by_group.setdefault(r["group_id"], []).append(r["msg_id"])
+    got = set(processed)
+    for gid, ids in by_group.items():
+        missing = [i for i in ids if i not in got]
+        assert not missing, f"会话 {gid}（{db.get_session(gid)}）漏抓 {missing}"
+
+
+def test_cap06_disconnect_and_wechat_restart_resume(tmp_path: Path):
+    """CAP-06 断线与微信重启后，游标续读：不丢、不重。"""
+    factory = _reader_factory()
+    db = SimulatedWeChatDB(tmp_path / "msg.db")
+    start = datetime(2026, 11, 11, 17, 0, 0, tzinfo=SHANGHAI)
+    expected = []
+    for i in range(8):
+        mid = f"pre-{i}"
+        db.insert(msg_id=mid, group_id="g1", sender_id="u", content=f"重启前{i}", ts=start + timedelta(seconds=i))
+        expected.append(mid)
+    store = {}
+    reader = _make_reader(factory, db, store)
+    first = _drain(reader, rounds=5, limit=5)
+    # 模拟断线 / 微信重启
+    db.simulate_wechat_restart()
+    for i in range(8, 15):
+        mid = f"post-{i}"
+        db.insert(msg_id=mid, group_id="g1", sender_id="u", content=f"重启后{i}", ts=start + timedelta(seconds=i))
+        expected.append(mid)
+    # 新读进程，同一游标
+    reader2 = _make_reader(factory, db, store)
+    rest = _drain(reader2)
+    processed = list(first) + list(rest)
+    report = reconcile(expected, processed)
+    assert report.miss_rate == 0.0, f"重启后续读漏抓 {report.missed_ids}"
+    assert report.dup_process_rate == 0.0, f"重启后续读重复处理 {report.duplicate_ids}"
+    assert "pre-0" in first
+    assert any(x.startswith("post-") for x in rest), "重启后写入的消息应被续读到"

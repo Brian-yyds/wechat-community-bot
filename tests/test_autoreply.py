@@ -185,6 +185,15 @@ def _make_service(clock, store=None, **kwargs):
 def _svc(clock=None, store=None, **kw):
     clock = clock or _Clock()
     svc, _src = _make_service(clock, store=store, **kw)
+    inner = svc.handle
+
+    def _handle(message, now=None):
+        current = now if now is not None else clock.now()
+        message = dict(message)
+        message["ts"] = current
+        return inner(message, now=current)
+
+    svc.handle = _handle
     return svc, clock
 
 

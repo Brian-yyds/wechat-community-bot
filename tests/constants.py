@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """测试与验收共用常量。"""
 
+import os
+
 CATEGORIES = ["提问", "行情讨论", "广告刷屏", "公告回复", "闲聊/无关", "需人工"]
 FORBIDDEN_CATEGORY = "禁止功能-上报"
 
@@ -11,11 +13,39 @@ AD_RECALL_THRESHOLD = 0.95
 FALSE_AD_THRESHOLD = 0.02
 FORBIDDEN_RECALL_THRESHOLD = 1.0
 
-LATENCY_P50_MAX = 5.0
-LATENCY_P95_MAX = 12.0
-HUMANIZE_MIN_FLOOR = 1.5
-HUMANIZE_MAX_CEILING = 8.0
-HUMANIZE_DEFAULT = (2.0, 6.0)
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# 分段延迟目标（可配）。不是「必须 2 秒内发出」之类的硬口号。
+# 规则回复且会话已打开：端到端 P95 目标 3s；其余场景 P95 目标 8s。
+LATENCY_OPEN_SESSION_RULE_P95 = _env_float("BOT_TEST_LATENCY_OPEN_P95", 3.0)
+LATENCY_OTHER_P95 = _env_float("BOT_TEST_LATENCY_OTHER_P95", 8.0)
+# 检出 + 决策的本地预算（规则引擎、库已落盘、会话已打开）
+LATENCY_DETECT_DECIDE_BUDGET = _env_float("BOT_TEST_DETECT_DECIDE_BUDGET", 0.5)
+# 旧名仅作「其余场景」预算别名，避免再出现 12s 硬门槛
+LATENCY_P95_MAX = LATENCY_OTHER_P95
+LATENCY_P50_MAX = _env_float("BOT_TEST_LATENCY_OTHER_P50", 5.0)
+
+# 拟人区间：默认 2–6s 适用于「其余 / 8s」路径，与「已打开会话 3s」冲突，
+# 故打开会话的规则回复使用单独可配的短区间。
+HUMANIZE_MIN_FLOOR = _env_float("BOT_TEST_HUMANIZE_FLOOR", 0.8)  # 全局最低，避免毫秒级秒回
+HUMANIZE_MAX_CEILING = _env_float("BOT_TEST_HUMANIZE_CEILING", 8.0)
+HUMANIZE_DEFAULT = (
+    _env_float("BOT_TEST_HUMANIZE_DEFAULT_MIN", 2.0),
+    _env_float("BOT_TEST_HUMANIZE_DEFAULT_MAX", 6.0),
+)
+HUMANIZE_OPEN_SESSION_DEFAULT = (
+    _env_float("BOT_TEST_HUMANIZE_OPEN_MIN", 1.0),
+    _env_float("BOT_TEST_HUMANIZE_OPEN_MAX", 2.2),
+)
 
 SCHEDULER_TOLERANCE_SECONDS = 5
 CATCH_UP_WINDOW_DEFAULT = 600
