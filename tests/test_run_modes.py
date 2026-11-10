@@ -278,3 +278,39 @@ def test_rate_limits_are_configurable_and_enforced(clock: FakeClock):
     assert limiter.try_acquire("g2", "auto_reply") is False
     # 公告不受自动回复的小时/分钟窗口限制
     assert limiter.try_acquire("g1", "announcement") is True
+
+
+
+def test_build_app_logs_effective_mode_and_source(tmp_path: Path, repo_root: Path, clock: FakeClock, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="wechat_bot"):
+        app = _app(tmp_path, repo_root, clock, mode="announce")
+    assert app["send_gate"].get_mode() == "announce"
+    assert app["run_mode_source"] in {"config", "state"}
+    joined = caplog.text
+    assert "运行模式生效" in joined
+    assert "announce" in joined
+    assert "来源" in joined
+
+
+def test_invalid_mode_does_not_force_overwrite_existing_state(tmp_path: Path, repo_root: Path, clock: FakeClock):
+    """非法 run.mode 回退 observe 时不得 mode_force，以免覆盖已有状态。"""
+    first = _app(tmp_path, repo_root, clock, mode="reply")
+    first["send_gate"].set_mode("reply")
+    assert (tmp_path / "run_mode.json").exists()
+    restarted = _app(tmp_path, repo_root, clock, mode="broadcast")
+    assert restarted["send_gate"].get_mode() == "reply"
+    assert restarted["run_mode"] is RunMode.REPLY
+    assert restarted["run_mode_source"] == "state"
+
+
+def test_corrupt_state_file_falls_back_to_observe_and_rewrites_legal_value(tmp_path: Path):
+    path = tmp_path / "run_mode.json"
+    path.write_text("{not-json", encoding="utf-8")
+    gate = SendGate(mode="announce", state_path=path, config_explicit=False)
+    assert gate.get_mode() == "observe"
+    assert gate.mode_source == "state_corrupt"
+    saved = path.read_text(encoding="utf-8")
+    assert "observe" in saved
+    assert "broadcast" not in saved

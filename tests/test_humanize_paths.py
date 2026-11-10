@@ -42,7 +42,7 @@ def test_open_session_range_is_short_and_documented():
 
 
 def test_open_session_floor_overrideable_via_config():
-    """产品默认下限 1.5s；核查建议 1.0s 只能通过配置覆盖，不改默认。"""
+    """产品默认下限 1.5s、短区间 1.5–2.4s；如需更短只能通过配置覆盖，不改默认。"""
     profiles = profiles_from_mapping(
         {
             "open_session_delay_min": 1.0,

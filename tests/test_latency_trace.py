@@ -269,3 +269,40 @@ def test_build_app_end_to_end_writes_latency_jsonl(tmp_path: Path, repo_root: Pa
     sent = [r for r in rows if r["outcome"] == "sent"]
     assert sent
     assert sent[0]["segments"]["humanize_delay_s"] == 2.0
+
+
+
+def test_announcement_send_writes_latency_jsonl(tmp_path: Path, repo_root: Path, clock: FakeClock):
+    """定时公告发出后应写入 latency.jsonl：含 run_mode、kind=announcement，不含正文。"""
+    from src.config_util import load_config
+    from src.main import build_app
+    from random import Random
+
+    config = load_config(repo_root / "config" / "example.toml", project_root=repo_root)
+    config = dict(config)
+    config["run"] = {"mode": "announce"}
+    rate = dict(config.get("rate_limit") or {})
+    rate["send_delay_min"] = 0
+    rate["send_delay_max"] = 0
+    rate["announcement_delay_min"] = 0
+    rate["announcement_delay_max"] = 0
+    rate["typing_hook"] = False
+    night = dict(rate.get("night_silent") or {})
+    night["enabled"] = False
+    rate["night_silent"] = night
+    config["rate_limit"] = rate
+    app = build_app(config, project_root=repo_root, clock=clock, rng=Random(1), data_dir=tmp_path)
+    anns = app["scheduler"].list_announcements()
+    assert anns
+    body = anns[0].text
+    app["scheduler"].fire_now(anns[0].id)
+    app["sender"].pump()
+    rows = app["latency_store"].read_all()
+    sent = [r for r in rows if r.get("kind") in {"announcement", "announce"}]
+    assert sent, f"定时公告应写入 latency.jsonl，实际 {rows}"
+    rec = sent[0]
+    assert rec.get("run_mode") == "announce"
+    assert rec.get("kind") in {"announcement", "announce"}
+    line = (tmp_path / "latency.jsonl").read_text(encoding="utf-8")
+    assert body not in line
+    assert body not in str(rec)
