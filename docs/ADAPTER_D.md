@@ -21,7 +21,7 @@
 
 ## 必须遵守的安全约定
 
-1. **限速**：生产路径必须继续走 `HumanizedSender`（现有 `src/ratelimit` 层），不要绕过它直接狂点。适配器也可注入 `RateLimiter`；`enforce_rate_limit=true` 时会自行获取令牌。与 HumanizedSender 叠用同一限速器时，请把 `enforce_rate_limit` 设为 `false`，避免令牌被扣两次。**无论该开关是否打开**，`send_text` 都会执行适配器内的每小时上限（默认 40 条，可配 `global_replies_per_hour` 或沿用 `rate_limit.global_replies_per_hour`），直接调用也不能绕过。
+1. **限速与运行模式**：生产路径必须继续走 `HumanizedSender`（现有 `src/ratelimit` 层）。`HumanizedSender` 构造时会把自身挂到 OCR 适配器（以及 `CompositeAdapter.outbound`）的 `attach_official_sender` 上。之后任何公开 `send_text` 只要未带 `through_official=True`，都必须再走同一套限速、运行模式与紧急暂停闸门。`HumanizedSender` 完成判定后以 `through_official=True` 进入实际 OCR 操作，适配器不再二次扣令牌。`enforce_rate_limit=true` 仅用于未挂接正式出口时自行获取令牌；与 HumanizedSender 叠用同一限速器时请保持 `false`。**无论该开关是否打开**，`send_text` 都会执行适配器内的每小时上限（默认 40 条，可配 `global_replies_per_hour` 或沿用 `rate_limit.global_replies_per_hour`）。未挂接正式发送器、也未注入 `SendGate` 时，直接 `send_text` **默认拒发**（未知运行模式等同 observe），并写不含正文的脱敏日志；仅测试可设 `allow_ungated_for_tests=true` 放行。
 2. **紧急暂停**：与 B（UIA 发送）使用同一约定，见 `src/adapters/pause.py`。默认文件是 `<data_dir>/PAUSE`（可用环境变量 `WECHAT_BOT_PAUSE_FILE` 覆盖）。文件存在就停止一切点击和粘贴。一键暂停：创建该空文件。恢复：人工确认后删除。
 3. **验证码 / 异常弹窗**：OCR 或屏幕文字命中「验证码」「安全验证」「异常登录」「环境异常」「请完成验证」「滑块」「账号异常」等时，立即写入 `PAUSE` 并停止，等待人工处理。没有自动打码或重试登录。
 4. **幂等**：同一 `group_id` + 同一文案在配置的时间窗内（默认 600 秒）不重复发送，状态写在 `data/ocr_idempotency.json`，重启后仍生效。
@@ -46,6 +46,7 @@ idempotency_window_seconds = 600
 # 直接调用 send_text 时是否自行扣令牌；经 HumanizedSender 时建议 false
 enforce_rate_limit = false
 # global_replies_per_hour = 40  # 直接 send_text 也会执行
+# allow_ungated_for_tests = false  # 仅测试；生产保持关闭
 # pause_file = "data/PAUSE"
 ```
 

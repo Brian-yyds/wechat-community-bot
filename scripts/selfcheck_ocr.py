@@ -95,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
     adapter = OcrOutboundAdapter(
+        allow_ungated_for_tests=True,  # 自检直接走 Fake，不装配 HumanizedSender
         driver=driver,
         engine=FakeOcrEngine(scripted=[{"text": "交易会员群演示 输入 发送", "confidence": 0.99}]),
         limiter=limiter,
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         dialogs=["验证码"],
     )
     captcha_adapter = OcrOutboundAdapter(
+        allow_ungated_for_tests=True,  # 自检直接走 Fake，不装配 HumanizedSender
         driver=captcha_driver,
         engine=FakeOcrEngine(scripted=[{"text": "请完成验证", "confidence": 0.99}]),
         limiter=limiter,
