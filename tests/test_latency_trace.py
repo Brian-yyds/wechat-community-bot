@@ -152,6 +152,8 @@ def test_pipeline_and_sender_fill_all_timestamps(clock: FakeClock, tmp_path: Pat
         config=HumanizeConfig(
             send_delay_min=2.0,
             send_delay_max=2.0,
+            open_session_delay_min=2.0,
+            open_session_delay_max=2.0,
             typing_hook=False,
             night=NightSilentConfig(enabled=False),
         ),

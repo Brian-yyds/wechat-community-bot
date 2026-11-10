@@ -24,6 +24,10 @@ def _fast_humanize() -> HumanizeConfig:
     return HumanizeConfig(
         send_delay_min=0,
         send_delay_max=0,
+        open_session_delay_min=0,
+        open_session_delay_max=0,
+        announcement_delay_min=0,
+        announcement_delay_max=0,
         typing_hook=False,
         night=NightSilentConfig(enabled=False),
     )
@@ -82,9 +86,11 @@ def test_invalid_mode_raises():
         parse_run_mode("broadcast")
 
 
-def test_invalid_mode_in_config_is_config_error(tmp_path: Path, repo_root: Path, clock: FakeClock):
-    with pytest.raises(ConfigError, match="未知运行模式"):
-        _app(tmp_path, repo_root, clock, mode="weird")
+def test_invalid_mode_in_config_falls_back_to_observe(tmp_path: Path, repo_root: Path, clock: FakeClock):
+    """非法 run.mode 默认安全：回退到 observe 继续只读运行，而不是拒绝启动或落到 reply。"""
+    app = _app(tmp_path, repo_root, clock, mode="weird")
+    assert app["run_mode"] is RunMode.OBSERVE
+    assert app["send_gate"].get_mode() == "observe"
 
 
 def test_example_config_default_is_observe(repo_root: Path, clock: FakeClock, tmp_path: Path):
