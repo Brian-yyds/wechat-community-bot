@@ -5,17 +5,23 @@
 延迟导入骨架，尚未在真实微信 4.x 上验证；Linux / box 请使用 Fake 实现。
 
 强制要求：
-- 走现有限速层（可注入 RateLimiter；生产路径仍应经 HumanizedSender）。
+- 走现有限速层（可注入 RateLimiter；生产路径必须经 HumanizedSender）。
+- 公开 send_text 在已挂接 HumanizedSender 时走同一套限速、运行模式与 PAUSE；
+  官方出口以 through_official=True 进入实际操作，避免二次扣令牌。
+- 未挂接正式发送器、也未注入 SendGate 时默认拒发（未知运行模式等同 observe），
+  仅允许显式测试开关 allow_ungated_for_tests 放行。
 - 发送前有输入停顿。
 - 发现异常弹窗 / 验证码立即写入 data/PAUSE 并停止，不得打码或绕过。
 - 遵守与 UIA 发送相同的紧急暂停约定（见 src.adapters.pause）。
 - 同一群同一文案在窗口内不重复发送。
+- 群名规范化后严格精确匹配；适配器内每小时上限默认 40 条，即使未注入限速器也生效。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
 import sys
 import threading
@@ -31,8 +37,11 @@ from typing import Any
 from src.adapters.base import OutboundAdapter, SentMessage
 from src.adapters.pause import PauseGate, SendPausedError
 from src.clock import Clock, SystemClock
+from src.logging_util import redact
 from src.ratelimit.bucket import RateLimiter
 
+
+logger = logging.getLogger("wechat_bot")
 
 # 与核查契约 tests/constants.py 中 OCR_CONFIDENCE_THRESHOLD 保持一致。
 DEFAULT_OCR_THRESHOLD = 0.70
@@ -600,6 +609,7 @@ class OcrOutboundAdapter(OutboundAdapter):
             limiter=limiter,
             enforce_rate_limit=bool(section.get("enforce_rate_limit", False)),
             global_replies_per_hour=int(per_hour),
+            allow_ungated_for_tests=bool(section.get("allow_ungated_for_tests", False)),
             pause=PauseGate(path=pause_file, data_dir=data_dir),
             data_dir=data_dir,
             clock=clock,
@@ -635,6 +645,8 @@ class OcrOutboundAdapter(OutboundAdapter):
         confirm_group_name: bool = True,
         send_kind: str = "auto_reply",
         global_replies_per_hour: int = DEFAULT_REPLIES_PER_HOUR,
+        send_gate: object | None = None,
+        allow_ungated_for_tests: bool = False,
     ) -> None:
         self.driver = driver or FakeScreenDriver()
         self.engine = engine or FakeOcrEngine()
@@ -664,15 +676,50 @@ class OcrOutboundAdapter(OutboundAdapter):
         self._sent: list[SentMessage] = []
         self.history: list[OcrSendResult] = []
         self._lock = threading.RLock()
+        self._official_sender = None
+        self.send_gate = send_gate
+        self.allow_ungated_for_tests = bool(allow_ungated_for_tests)
+        self._last_result: OcrSendResult | None = None
 
     @property
     def sent_messages(self) -> list[SentMessage]:
         with self._lock:
             return list(self._sent)
 
-    def send_text(self, group_id: str, text: str) -> None:
-        result = self._send(group_id, text)
+    @property
+    def last_result(self) -> OcrSendResult | None:
+        return self._last_result
+
+    def attach_official_sender(self, sender: object) -> None:
+        """由 HumanizedSender 挂接正式出口（限速 + 运行模式 + 暂停）。"""
+        self._official_sender = sender
+
+    def send_text(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        send_id: str | None = None,
+        through_official: bool = False,
+        kind: str | None = None,
+    ) -> None:
+        """公开发送入口。未带 through_official 时走挂接的正式闸门。
+
+        无正式发送器且未注入 SendGate 时默认拒发，避免在 observe 约定下绕过运行模式。
+        仅当 allow_ungated_for_tests=True 时才允许这种无闸门直发（测试用）。
+        """
+        result = self._send(
+            group_id,
+            text,
+            send_id=send_id,
+            through_official=through_official,
+            kind=kind or self.send_kind,
+        )
+        self._last_result = result
         self.history.append(result)
+        if through_official:
+            # 正式出口以 last_result 回报成败，避免异常冲出 HumanizedSender.pump。
+            return
         if not result.ok and result.status not in {"skipped_duplicate", "dry_run"}:
             # dry_run / 幂等跳过不算失败异常，其它失败向上抛，便于调用方感知。
             if result.status == "paused":
@@ -686,7 +733,22 @@ class OcrOutboundAdapter(OutboundAdapter):
             if result.error:
                 raise RuntimeError(result.error)
 
-    def _send(self, group_id: str, text: str) -> OcrSendResult:
+    def _send(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        send_id: str | None = None,
+        through_official: bool = False,
+        kind: str | None = None,
+    ) -> OcrSendResult:
+        send_kind = kind or self.send_kind
+        if not through_official:
+            blocked = self._blocked_by_gate(send_kind, group_id)
+            if blocked is not None:
+                status, error = blocked
+                return OcrSendResult(False, status, group_id, text, error)
+
         try:
             self.pause.check()
         except SendPausedError as exc:
@@ -710,9 +772,16 @@ class OcrOutboundAdapter(OutboundAdapter):
                 f"已达到每小时 {self.global_replies_per_hour} 条上限，本轮不发送。",
             )
 
-        if self.limiter is not None and self.enforce_rate_limit:
+        # 已经由 HumanizedSender / 正式闸门扣过令牌时不再 acquire，避免二次扣除。
+        use_own_limiter = (
+            not through_official
+            and self._official_sender is None
+            and self.limiter is not None
+            and self.enforce_rate_limit
+        )
+        if use_own_limiter:
             now = self.clock.now()
-            wait = self.limiter.time_until_allow(group_id, self.send_kind, now)
+            wait = self.limiter.time_until_allow(group_id, send_kind, now)
             if wait > self.max_rate_wait_seconds:
                 return OcrSendResult(
                     False,
@@ -723,7 +792,7 @@ class OcrOutboundAdapter(OutboundAdapter):
                 )
             if wait > 0:
                 self.clock.sleep(wait)
-            if not self.limiter.try_acquire(group_id, self.send_kind, self.clock.now()):
+            if not self.limiter.try_acquire(group_id, send_kind, self.clock.now()):
                 return OcrSendResult(
                     False,
                     "rate_limited",
@@ -800,6 +869,56 @@ class OcrOutboundAdapter(OutboundAdapter):
             self._sent.append(record)
         self._record_hourly()
         return OcrSendResult(True, "ok", group_id, text)
+
+    def _log_gate_drop(self, reason: str, *, kind: str, group_id: str) -> None:
+        """记录被闸门丢弃的发送。不写入消息正文，便于脱敏日志过滤器处理。"""
+        logger.info(
+            "发送已丢弃：%s；kind=%s group_id=%s adapter=ocr",
+            redact(reason),
+            redact(kind),
+            redact(group_id or "-"),
+        )
+
+    def _decision_to_block(self, decision: object, *, kind: str, group_id: str) -> tuple[str, str] | None:
+        if decision is None or getattr(decision, "allowed", True):
+            return None
+        reason = str(getattr(decision, "reason", "") or "发送闸门拒绝")
+        status = "paused" if getattr(decision, "paused", False) else "rejected"
+        self._log_gate_drop(reason, kind=kind, group_id=group_id)
+        return status, reason
+
+    def _blocked_by_official_gate(self, kind: str, group_id: str) -> tuple[str, str] | None:
+        """已挂接正式发送器时，直接 send_text 也必须经过运行模式、暂停与限速。"""
+        sender = self._official_sender
+        if sender is None:
+            return None
+        gate = getattr(sender, "send_gate", None) or self.send_gate
+        if gate is not None and hasattr(gate, "decide"):
+            blocked = self._decision_to_block(gate.decide(kind), kind=kind, group_id=group_id)
+            if blocked is not None:
+                return blocked
+        limiter = getattr(sender, "limiter", None)
+        if limiter is not None and hasattr(limiter, "try_acquire"):
+            kind_name = kind if kind in {"auto_reply", "announcement"} else "auto_reply"
+            if not limiter.try_acquire(group_id, kind_name, self.clock.now()):
+                reason = "已达到限速配额，直接发送被拒绝"
+                self._log_gate_drop(reason, kind=kind_name, group_id=group_id)
+                return "rate_limited", reason
+        return None
+
+    def _blocked_by_gate(self, kind: str, group_id: str) -> tuple[str, str] | None:
+        if self._official_sender is not None:
+            return self._blocked_by_official_gate(kind, group_id)
+        if self.send_gate is not None and hasattr(self.send_gate, "decide"):
+            return self._decision_to_block(self.send_gate.decide(kind), kind=kind, group_id=group_id)
+        if self.allow_ungated_for_tests:
+            return None
+        reason = (
+            "未挂接正式发送闸门，默认拒绝发送"
+            "（运行模式未知，等同 observe）。请经 HumanizedSender 发送或注入 SendGate。"
+        )
+        self._log_gate_drop(reason, kind=kind, group_id=group_id)
+        return "rejected", reason
 
     def _hourly_limit_reached(self) -> bool:
         """适配器内统一限额：即使未注入 RateLimiter / 关闭 enforce_rate_limit 也生效。"""
