@@ -269,3 +269,101 @@ def test_role_is_implemented_and_factory_builds_it(tmp_path: Path, clock: FakeCl
 
     assert isinstance(adapter, CompositeAdapter)
     assert isinstance(adapter.outbound, OcrOutboundAdapter)
+
+def test_group_name_substring_is_not_confirmation(tmp_path: Path, clock: FakeClock):
+    from src.adapters.ocr import normalize_ui_text
+
+    assert normalize_ui_text(" 交易会员群－主群 ") == normalize_ui_text("交易会员群-主群")
+    driver = _ready_driver()
+    # 覆盖为截断子串
+    driver.elements = [
+        __import__("src.adapters.ocr", fromlist=["TextBox"]).TextBox(text="主群", x=80, y=20, width=40, height=20, confidence=0.99),
+        __import__("src.adapters.ocr", fromlist=["TextBox"]).TextBox(text="输入", x=200, y=400, width=80, height=24, confidence=0.99),
+        __import__("src.adapters.ocr", fromlist=["TextBox"]).TextBox(text="发送", x=360, y=400, width=48, height=24, confidence=0.99),
+    ]
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=None,
+        enforce_rate_limit=False,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    with pytest.raises(GroupNotConfirmedError, match="确认群名"):
+        adapter.send_text("g1", "不能凭子串发送")
+    assert driver.clicks == []
+    assert driver.pastes == []
+
+
+def test_normalized_exact_group_name_still_sends(tmp_path: Path, clock: FakeClock):
+    driver = FakeScreenDriver(
+        elements=[
+            {"text": " 交易会员群－主群 ", "x": 80, "y": 20, "width": 120, "height": 20, "confidence": 0.99},
+            {"text": "输入", "x": 200, "y": 400, "width": 80, "height": 24, "confidence": 0.99},
+            {"text": "发送", "x": 360, "y": 400, "width": 48, "height": 24, "confidence": 0.99},
+        ]
+    )
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=None,
+        enforce_rate_limit=False,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    adapter.send_text("g1", "规范化后精确匹配应发送")
+    assert driver.pastes == ["规范化后精确匹配应发送"]
+
+
+def test_ambiguous_group_name_pauses_and_does_not_send(tmp_path: Path, clock: FakeClock):
+    driver = FakeScreenDriver(
+        elements=[
+            {"text": "交易会员群-主群", "x": 80, "y": 20, "width": 120, "height": 20, "confidence": 0.99},
+            {"text": "交易会员群-主群", "x": 80, "y": 200, "width": 120, "height": 20, "confidence": 0.99},
+            {"text": "输入", "x": 200, "y": 400, "width": 80, "height": 24, "confidence": 0.99},
+            {"text": "发送", "x": 360, "y": 400, "width": 48, "height": 24, "confidence": 0.99},
+        ]
+    )
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=None,
+        enforce_rate_limit=False,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    with pytest.raises(GroupNotConfirmedError, match="不唯一"):
+        adapter.send_text("g1", "匹配不唯一不得发送")
+    assert (tmp_path / "PAUSE").exists()
+    assert driver.clicks == []
+    assert driver.pastes == []
+
+
+def test_direct_send_text_enforces_hourly_limit_without_limiter(tmp_path: Path, clock: FakeClock):
+    """enforce_rate_limit=false 且未注入限速器时，直接 send_text 仍受每小时 40 条上限约束。"""
+    driver = _ready_driver()
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=None,
+        enforce_rate_limit=False,
+        global_replies_per_hour=40,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+        dry_run=True,
+    )
+    for i in range(40):
+        adapter.send_text("g1", f"第{i}条合规回复")
+    assert len(adapter.sent_messages) == 40
+    with pytest.raises(RateLimitedError, match="每小时"):
+        adapter.send_text("g1", "第41条应被每小时上限拦截")
+    assert len(adapter.sent_messages) == 40
+    assert adapter.history[-1].status == "rate_limited"

@@ -156,3 +156,106 @@ def test_role_is_implemented_and_factory_builds_it(clock: FakeClock):
     assert isinstance(adapter, CompositeAdapter)
     assert isinstance(adapter.inbound, NotificationAdapter)
     assert adapter.inbound.is_complete_source() is False
+
+def test_wake_a_on_preview_false_does_not_auto_wire(clock: FakeClock):
+    adapter = build_adapter(
+        {
+            "wechat": {"inbound": "mock", "outbound": "mock"},
+            "inbound": {
+                "notification": {
+                    "enabled": True,
+                    "source": "fake",
+                    "wake_a_on_preview": False,
+                }
+            },
+        },
+        groups=[Group("g1", "演示群")],
+        clock=clock,
+    )
+    assert isinstance(adapter, CompositeAdapter)
+    assert adapter.notification is not None
+    assert adapter.notification.wake_callback is None
+    assert adapter.wake_target is None
+
+
+def test_wake_a_on_preview_true_wires_by_default(clock: FakeClock):
+    class Capture(MockAdapter):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wakes = []
+
+        def request_immediate_poll(self, hint) -> None:
+            self.wakes.append(getattr(hint, "group", hint))
+
+    # 用已构造的 inbound 不易走 factory；这里验证默认配置会设置 wake_target。
+    adapter = build_adapter(
+        {
+            "wechat": {"inbound": "mock", "outbound": "mock"},
+            "inbound": {
+                "notification": {
+                    "enabled": True,
+                    "source": "fake",
+                    "wake_a_on_preview": True,
+                }
+            },
+        },
+        groups=[Group("g1", "演示群")],
+        clock=clock,
+    )
+    assert isinstance(adapter, CompositeAdapter)
+    assert adapter.wake_target is adapter.inbound
+    assert adapter.notification is not None
+    assert adapter.notification.wake_callback is not None
+
+
+def test_wake_budget_and_merge_by_group(clock: FakeClock):
+    source = FakeNotificationSource(clock=clock)
+    woken = []
+    adapter = NotificationAdapter(
+        source=source,
+        clock=clock,
+        wake_callback=lambda h: woken.append(h.group),
+        wake_budget_per_poll=2,
+        merge_wake_by_group=True,
+    )
+    from datetime import timedelta
+
+    base = datetime(2026, 11, 11, 13, 0, 0)
+    # 同一群两条 + 另外两群，共 4 条预览，唤醒应合并为每群一次且最多 2 次。
+    source.push("A群", "预览1", ts=base)
+    source.push("A群", "预览2", ts=base + timedelta(seconds=1))
+    source.push("B群", "预览3", ts=base + timedelta(seconds=2))
+    source.push("C群", "预览4", ts=base + timedelta(seconds=3))
+    hints = adapter.poll_once()
+    assert len(hints) == 4
+    assert all(h.partial is True for h in hints)
+    assert woken == ["A群", "B群"]
+
+
+def test_pipeline_does_not_auto_reply_to_partial_preview(clock: FakeClock):
+    from src.adapters.base import Message
+    from src.pipeline.pipeline import Pipeline
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.sent = []
+
+        def submit_auto_reply(self, group_id, text, **kwargs) -> None:
+            self.sent.append((group_id, text))
+
+    sender = Recorder()
+    pipe = Pipeline(sender=sender, clock=clock)
+    msg = Message(
+        message_id="notify-1",
+        group_id="g1",
+        sender_id="u1",
+        content="你好",
+        timestamp=clock.now(),
+        sender_name="演示用户",
+        extra={"partial": True, "source": "notification", "complete": False},
+    )
+    result = pipe.process(msg)
+    assert result.skipped is True
+    assert result.skip_reason == "partial_preview"
+    assert result.reply_text is None
+    assert sender.sent == []
