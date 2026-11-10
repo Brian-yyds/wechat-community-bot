@@ -13,15 +13,36 @@ import logging
 import sys
 from typing import Any
 
+import src.logging_util as logging_util
 from src.adapters.ui_driver import (
     ChatNotFoundError,
     SendTimeoutError,
     UiaDependencyError,
     UiDriver,
     UiNotReadyError,
+    normalize_chat_title,
+    titles_match,
 )
 
 logger = logging.getLogger(__name__)
+
+# 窗口/弹窗文案中这些关键词视为登录异常、被踢、需扫码或验证码。
+_LOGIN_OR_CAPTCHA_HINTS = (
+    "验证码",
+    "安全验证",
+    "异常登录",
+    "环境异常",
+    "请完成验证",
+    "滑块",
+    "账号异常",
+    "扫码登录",
+    "扫描二维码",
+    "已被踢",
+    "登录失效",
+    "重新登录",
+    "登录过期",
+    "请重新登录",
+)
 
 _MISSING_HINT = (
     "真实 UIA 发送需要在用户 Windows 电脑上安装可选依赖："
@@ -151,7 +172,7 @@ class PyWeixinDriver(UiDriver):
         self._messages = messages
         logger.info(
             "已加载 pyweixin 后端（尚未在真实微信上验收）。Messages=%s",
-            type(messages).__name__ if messages is not None else "无",
+            logging_util.redact(str(type(messages).__name__ if messages is not None else "无")),
         )
 
     def _try_load_pywinauto(self) -> None:
@@ -195,11 +216,17 @@ class PyWeixinDriver(UiDriver):
                 win = self._top_window()
                 return bool(win) and win.is_visible()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("查找微信窗口失败: %s", exc)
+                logger.warning("查找微信窗口失败: %s", logging_util.redact(str(exc)))
                 return False
-        # pyweixin：若能导入，认为调用方需要再做窗口级探测；无法确认时返回 True
-        # 会在后续 open_chat 中暴露问题，避免在这里假装失败或成功。
-        return self._messages is not None or self._backend is not None
+        # 仅导入成功不能当作窗口已可达；无法确认时保守返回 False。
+        fn = self._find_callable(["find_chat_window", "is_wechat_open", "is_window_visible"])
+        if fn is not None:
+            try:
+                return bool(fn())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("查找微信窗口失败: %s", logging_util.redact(str(exc)))
+                return False
+        return False
 
     def open_chat(self, group_name: str) -> None:
         self._ensure()
@@ -215,8 +242,15 @@ class PyWeixinDriver(UiDriver):
         if fn is not None:
             try:
                 fn(group_name)
+                title = self.read_chat_title()
+                if not titles_match(title, group_name):
+                    raise ChatNotFoundError(
+                        f"打开会话后窗口标题与目标群不一致: {title!r} != {group_name!r}"
+                    )
                 self._current = group_name
                 return
+            except ChatNotFoundError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc).lower()
                 if "not found" in msg or "找不到" in msg or "no such" in msg:
@@ -293,7 +327,7 @@ class PyWeixinDriver(UiDriver):
                     return False
                 return text in str(result)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("校验已发送失败: %s", exc)
+                logger.warning("校验已发送失败: %s", logging_util.redact(str(exc)))
                 return False
         # 没有可靠校验接口时返回 False，由上层标 maybe_sent，避免误判成功。
         logger.warning("当前后端无法校验是否发送成功（未验证的真实驱动），将视为未确认")
@@ -310,8 +344,10 @@ class PyWeixinDriver(UiDriver):
                 return bool(fn())
             except Exception:  # noqa: BLE001
                 return False
-        # 能连到窗口只说明进程在，不能等同已登录；保守地看窗口是否可见。
-        return self.is_window_visible()
+        # 没有明确登录接口时，若发现扫码/被踢/登录窗则视为掉线；否则保守返回 False。
+        if self._window_has_login_or_captcha_hints():
+            return False
+        return False
 
     def is_locked(self) -> bool:
         if sys.platform != "win32":
@@ -358,11 +394,24 @@ class PyWeixinDriver(UiDriver):
             try:
                 return bool(fn())
             except Exception:  # noqa: BLE001
-                return False
+                # 探测接口失败时保守视为存在阻断弹窗。
+                return True
+        if self._window_has_login_or_captcha_hints():
+            return True
+        # 无法可靠探测时保守视为可能有阻断，由上层暂停而不是当成无弹窗。
+        if self._backend_name != "pywinauto" and fn is None:
+            return True
         return False
 
     def current_chat(self) -> str | None:
         return self._current
+
+    def read_chat_title(self) -> str | None:
+        """读取当前可见会话标题，供发送前精确核对。失败返回 None，不得假装等于内存值。"""
+        title = self._read_window_title()
+        if title:
+            return normalize_chat_title(title)
+        return None
 
     def probe(self) -> dict[str, Any]:
         info = describe_backend()
@@ -417,10 +466,6 @@ class PyWeixinDriver(UiDriver):
                 fn = getattr(src, name, None)
                 if callable(fn):
                     return fn
-                # 有些版本把方法放在类上，需要先实例化
-                cls = getattr(src, name[0].upper() + name[1:], None) if False else None
-                if cls:
-                    pass
         return None
 
     def _top_window(self):
@@ -434,15 +479,25 @@ class PyWeixinDriver(UiDriver):
         raise UiNotReadyError("当前 pywinauto 连接没有 top_window")
 
     def _pywinauto_open_chat(self, group_name: str) -> None:
-        """保守实现：用搜索框寻找会话。失败则明确抛错，不假装成功。"""
+        """保守实现：用搜索框寻找会话，并核对窗口标题（规范化后严格精确匹配）。"""
         try:
             win = self._top_window()
             win.set_focus()
             # Ctrl+F 打开搜索在不同版本上并不稳定，失败就告诉调用方未验证。
             win.type_keys("^f")
-            win.type_keys(group_name, with_spaces=True)
+            # 禁止直接 type_keys(group_name)：+^%{} 必须先 escape。
+            escaped_name = escape_pywinauto_keys(group_name)
+            win.type_keys(escaped_name, with_spaces=True, pause=0.05)
             win.type_keys("{ENTER}")
+            title = self.read_chat_title() or self._window_title_from(win)
+            if not titles_match(title, group_name):
+                raise ChatNotFoundError(
+                    f"搜索打开后窗口标题与目标群不一致（拒绝发错群）: {title!r} != {group_name!r}"
+                )
+            # 标题已通过 window_text / titles_match 校验后再写入。
             self._current = group_name
+        except ChatNotFoundError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise ChatNotFoundError(
                 f"无法用 pywinauto 打开会话 {group_name}（未经验证的降级路径）: {exc}"
@@ -460,20 +515,100 @@ class PyWeixinDriver(UiDriver):
                         return
                 except Exception:  # noqa: BLE001
                     continue
-            try:
-                import win32clipboard  # type: ignore
+            # 剪贴板降级：先 GetClipboard 保存用户 previous/old_clip，粘贴后 restore 或清空。
+            import win32clipboard  # type: ignore
 
+            old_clip = None
+            saved = False
+            try:
                 win32clipboard.OpenClipboard()
                 try:
+                    try:
+                        old_clip = win32clipboard.GetClipboardData()
+                        saved = True
+                    except Exception:  # noqa: BLE001
+                        old_clip = None
                     win32clipboard.EmptyClipboard()
                     win32clipboard.SetClipboardText(text)
                 finally:
                     win32clipboard.CloseClipboard()
                 win.type_keys("^v")
-                return
-            except Exception as exc:  # noqa: BLE001
-                raise UiNotReadyError(f"无法把文本写入输入框: {exc}") from exc
+            finally:
+                # 发送后恢复 previous 剪贴板，或 EmptyClipboard 以免消息正文残留。
+                try:
+                    win32clipboard.OpenClipboard()
+                    try:
+                        win32clipboard.EmptyClipboard()
+                        if saved and old_clip is not None:
+                            if isinstance(old_clip, str):
+                                win32clipboard.SetClipboardText(old_clip)
+                            else:
+                                win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, old_clip)
+                    finally:
+                        win32clipboard.CloseClipboard()
+                except Exception:  # noqa: BLE001
+                    logger.warning("恢复或清空剪贴板失败: %s", logging_util.redact("clipboard-restore"))
         except UiNotReadyError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise UiNotReadyError(f"粘贴文本失败: {exc}") from exc
+
+    def _read_window_title(self) -> str | None:
+        fn = self._find_callable(["window_text", "window_title", "get_title", "current_chat_name"])
+        if fn is not None:
+            try:
+                value = fn()
+                if value:
+                    return str(value)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取会话标题失败: %s", logging_util.redact(str(exc)))
+        if self._backend_name == "pywinauto":
+            try:
+                return self._window_title_from(self._top_window())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取窗口标题失败: %s", logging_util.redact(str(exc)))
+        return None
+
+    def _window_title_from(self, win) -> str | None:
+        for attr in ("window_text", "texts", "element_info"):
+            try:
+                if attr == "window_text" and hasattr(win, "window_text"):
+                    return str(win.window_text() or "") or None
+                if attr == "texts" and hasattr(win, "texts"):
+                    texts = win.texts()
+                    if texts:
+                        return str(texts[0])
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _window_has_login_or_captcha_hints(self) -> bool:
+        """扫描可见窗口文案，识别验证码、被踢或扫码登录。探测失败则返回 True（保守暂停）。"""
+        try:
+            title = self._read_window_title() or ""
+            blob = title
+            if self._backend_name == "pywinauto":
+                try:
+                    win = self._top_window()
+                    if hasattr(win, "descendants"):
+                        for child in win.descendants()[:80]:
+                            try:
+                                blob += " " + str(child.window_text() or "")
+                            except Exception:  # noqa: BLE001
+                                continue
+                except Exception:  # noqa: BLE001
+                    return True
+            return any(hint in blob for hint in _LOGIN_OR_CAPTCHA_HINTS)
+        except Exception:  # noqa: BLE001
+            return True
+
+
+def escape_pywinauto_keys(text: str) -> str:
+    """转义 pywinauto type_keys 的特殊字符：+、^、%、{、}、(、)。"""
+    out = []
+    for ch in text or "":
+        if ch in "+^%{}()":
+            out.append("{" + ch + "}")
+        else:
+            out.append(ch)
+    return "".join(out)
