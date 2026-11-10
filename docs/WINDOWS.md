@@ -50,6 +50,7 @@ Copy-Item config\example.toml config\local.toml
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\selfcheck.py
+.\.venv\Scripts\python.exe scripts\selfcheck_local_capture.py --simulate
 .\.venv\Scripts\python.exe scripts\selfcheck_notification.py
 .\.venv\Scripts\python.exe scripts\selfcheck_ocr.py
 .\.venv\Scripts\python.exe -m src.main --demo
