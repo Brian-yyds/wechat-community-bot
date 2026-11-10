@@ -14,6 +14,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def normalize_chat_title(name: str | None) -> str:
+    """规范化会话标题：去掉首尾空白并压缩中间空白，便于精确匹配。"""
+    return " ".join((name or "").strip().split())
+
+
+def titles_match(actual: str | None, expected: str | None) -> bool:
+    """规范化后严格精确匹配。同名前缀或仅部分相同一律视为不匹配。"""
+    left = normalize_chat_title(actual)
+    right = normalize_chat_title(expected)
+    return bool(left) and left == right
+
+
 class UiaError(Exception):
     """UIA 发送相关错误的基类。"""
 
@@ -103,7 +115,17 @@ class UiDriver(ABC):
         return False
 
     def current_chat(self) -> str | None:
-        """当前已打开的会话显示名；未知时返回 None。"""
+        """当前已打开的会话显示名；未知时返回 None。
+
+        调用方不要只信内存缓存。发送前应通过 read_chat_title 核对窗口标题。
+        """
+        return None
+
+    def read_chat_title(self) -> str | None:
+        """读取当前窗口中可见的会话标题。默认未知。
+
+        与 current_chat 分开：后者可能只是内存值，本方法应尽量读真实 UI。
+        """
         return None
 
     def probe(self) -> dict[str, Any]:
@@ -231,6 +253,10 @@ class FakeUiDriver(UiDriver):
         return bool(self.blocking_dialog)
 
     def current_chat(self) -> str | None:
+        return self.current
+
+    def read_chat_title(self) -> str | None:
+        """以实际窗口字段为准，不受 current_chat 被包装覆盖的影响。"""
         return self.current
 
     def probe(self) -> dict[str, Any]:

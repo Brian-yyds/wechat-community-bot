@@ -36,6 +36,7 @@ from src.adapters.ui_driver import (
     UiaError,
     UiDriver,
     UiNotReadyError,
+    titles_match,
 )
 from src.clock import Clock, SystemClock
 from src.logging_util import redact
@@ -199,12 +200,17 @@ class UiaConfig:
 
 
 class SentIdStore:
-    """持久化已发送 / 可能已发送的消息 id，避免重启后重复发送。"""
+    """持久化已发送 / 可能已发送的消息 id，避免重启后重复发送。
+
+    文件损坏时进入 fail-safe：隔离旧文件、拒绝读取空记录继续发送，必须人工对账。
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict[str, Any]] = {}
+        self.corrupt = False
+        self.corrupt_reason = ""
         self._load()
 
     def _load(self) -> None:
@@ -212,11 +218,26 @@ class SentIdStore:
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("读取发送幂等记录失败，将以空记录继续: %s", exc)
+            if not isinstance(raw, dict):
+                raise json.JSONDecodeError("幂等记录不是对象", "", 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            self.corrupt = True
+            self.corrupt_reason = str(exc)
+            try:
+                quarantined = self.path.with_name(self.path.name + ".corrupt")
+                self.path.replace(quarantined)
+                logger.warning(
+                    "读取发送幂等记录失败，已隔离损坏文件并拒绝自动重发: %s",
+                    redact(str(exc)),
+                )
+            except OSError as move_exc:
+                logger.warning(
+                    "读取发送幂等记录失败且无法隔离文件，拒绝自动重发: %s / %s",
+                    redact(str(exc)),
+                    redact(str(move_exc)),
+                )
             return
-        if isinstance(raw, dict):
-            self._data = raw
+        self._data = raw
 
     def _flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,8 +269,9 @@ def resolve_group_name(group_id: str, mapping: dict[str, str]) -> str:
 class UiaOutboundAdapter(OutboundAdapter):
     """OutboundAdapter 实现：把文本经 UiDriver 发到指定群。
 
-    不绕过限速层：生产路径应由 HumanizedSender 调用 send_text / send。
-    本类只负责 UI 操作、适配器内间隔、幂等、紧急暂停与分段打点。
+    公开 send / send_text 在已挂接 HumanizedSender 时必须经过限速、运行模式与 PAUSE；
+    未挂接时只做暂停与 UI 防护，不得当成已经限速。HumanizedSender 完成闸门判定后
+    以 through_official=True 进入实际 UI 操作。本类同时负责间隔、幂等、暂停与分段打点。
     """
 
     def __init__(
@@ -290,6 +312,7 @@ class UiaOutboundAdapter(OutboundAdapter):
         data_dir.mkdir(parents=True, exist_ok=True)
         self._store = SentIdStore(data_dir / "uia_sent_ids.json")
         self._pause_gate = PauseGate(self.config.resolve_pause_flag(self.project_root))
+        self._official_sender = None
 
     # --- 供测试与自检查询 ---
 
@@ -342,9 +365,27 @@ class UiaOutboundAdapter(OutboundAdapter):
         except Exception:  # noqa: BLE001
             logger.debug("关闭 UiDriver 时忽略异常", exc_info=True)
 
-    def send_text(self, group_id: str, text: str, *, send_id: str | None = None) -> None:
-        """OutboundAdapter 契约：发送纯文本。结果写入 last_result，不绕过限频。"""
-        self.send(group_id, text, send_id=send_id)
+    def attach_official_sender(self, sender: object) -> None:
+        """由 HumanizedSender 挂接正式出口（限速 + 运行模式 + 暂停）。"""
+        self._official_sender = sender
+
+    def send_text(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        send_id: str | None = None,
+        through_official: bool = False,
+        kind: str = "auto_reply",
+    ) -> None:
+        """公开发送入口。未带 through_official 时走挂接的正式闸门。"""
+        self.send(
+            group_id,
+            text,
+            send_id=send_id,
+            through_official=through_official,
+            kind=kind,
+        )
 
     def notify_typing(self, group_id: str) -> None:
         # 仅在窗口已就绪时尝试聚焦输入框，失败则忽略，避免为「正在输入」去切群。
@@ -363,8 +404,14 @@ class UiaOutboundAdapter(OutboundAdapter):
         *,
         timeout: float | None = None,
         send_id: str | None = None,
+        through_official: bool = False,
+        kind: str = "auto_reply",
     ) -> UiaSendResult:
-        """契约方法：发送并返回可区分的状态与分段耗时。"""
+        """发送并返回可区分的状态与分段耗时。
+
+        公开调用默认检查已挂接的正式闸门。HumanizedSender 在自己完成
+        限速与模式判定后，以 through_official=True 进入实际 UI 操作。
+        """
         wall0 = time.perf_counter()
         timings = StageTimings(preheat=self._preheat_timings)
         timeout_s = float(self.config.send_timeout_seconds if timeout is None else timeout)
@@ -393,6 +440,23 @@ class UiaOutboundAdapter(OutboundAdapter):
             )
             self._last_result = result
             return result
+
+        if not (text or "").strip():
+            return _finish(False, UiaSendStatus.REJECTED, "空文本不得发送", attempts=0)
+
+        if self._store.corrupt:
+            msg = (
+                "发送幂等记录已损坏，拒绝自动重发，请人工对账后恢复。"
+                + (f" 原因: {self._store.corrupt_reason}" if self._store.corrupt_reason else "")
+            )
+            self._record_alert("idempotency_store_corrupt", msg)
+            return _finish(False, UiaSendStatus.MAYBE_SENT, msg, attempts=0)
+
+        if not through_official:
+            blocked = self._blocked_by_official_gate(kind, group)
+            if blocked is not None:
+                status, error = blocked
+                return _finish(False, status, error, attempts=0)
 
         if send_id:
             existing = self._store.get(send_id)
@@ -434,7 +498,8 @@ class UiaOutboundAdapter(OutboundAdapter):
 
             try:
                 self._wait_min_interval()
-                already_open = self.driver.current_chat() == group_name
+                visible = self._read_visible_title()
+                already_open = titles_match(visible, group_name)
                 timings.chat_was_open = already_open and attempts == 1
                 t_open = time.perf_counter()
                 if not already_open:
@@ -446,20 +511,38 @@ class UiaOutboundAdapter(OutboundAdapter):
                         raise UiNotReadyError("找不到微信聊天窗口")
                     self.driver.open_chat(group_name)
                     self._last_switch_at = self.clock.now()
+                    visible = self._read_visible_title()
+                    if not titles_match(visible, group_name):
+                        raise ChatNotFoundError(
+                            f"打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: {visible!r} != {group_name!r}"
+                        )
                 timings.open_chat += time.perf_counter() - t_open
 
                 t_paste = time.perf_counter()
+                mid_pause = self._check_pause()
+                if mid_pause is not None:
+                    return _finish(False, UiaSendStatus.PAUSED, mid_pause, attempts=attempts)
                 self.driver.focus_input()
                 pause = self._random_between(self.config.input_pause_min, self.config.input_pause_max)
                 if pause > 0:
                     self.clock.sleep(pause)
                     timings.input_pause += pause
+                mid_pause = self._check_pause()
+                if mid_pause is not None:
+                    return _finish(False, UiaSendStatus.PAUSED, mid_pause, attempts=attempts)
+                if not titles_match(self._read_visible_title(), group_name):
+                    raise ChatNotFoundError("粘贴前窗口标题已不是目标群，拒绝发送以免发错群")
                 if time.perf_counter() > deadline:
                     raise SendTimeoutError("粘贴前已超时")
                 self.driver.paste_text(text)
                 timings.paste += time.perf_counter() - t_paste
 
                 t_send = time.perf_counter()
+                mid_pause = self._check_pause()
+                if mid_pause is not None:
+                    return _finish(False, UiaSendStatus.PAUSED, mid_pause, attempts=attempts)
+                if not titles_match(self._read_visible_title(), group_name):
+                    raise ChatNotFoundError("按下发送前窗口标题已不是目标群，拒绝发送以免发错群")
                 if time.perf_counter() > deadline:
                     raise SendTimeoutError("按下发送前已超时")
                 self.driver.press_send()
@@ -490,7 +573,7 @@ class UiaOutboundAdapter(OutboundAdapter):
                     self._store.mark(send_id, UiaSendStatus.MAYBE_SENT)
                 return _finish(
                     False,
-                    UiaSendStatus.REJECTED,
+                    UiaSendStatus.MAYBE_SENT,
                     "已按下发送但未能校验成功，为避免刷屏不再重试",
                     attempts=attempts,
                 )
@@ -630,6 +713,35 @@ class UiaOutboundAdapter(OutboundAdapter):
         # 受 reopen_min_interval 约束，避免刚切走又立即切回造成异常操作模式
         self.keep_chat_open(primary)
 
+    def _read_visible_title(self) -> str | None:
+        """读取真实窗口标题，不采用可能过期的 current_chat 内存值。"""
+        reader = getattr(self.driver, "read_chat_title", None)
+        if callable(reader):
+            try:
+                return reader()
+            except Exception:  # noqa: BLE001
+                logger.debug("读取窗口标题失败", exc_info=True)
+                return None
+        return None
+
+    def _blocked_by_official_gate(self, kind: str, group_id: str) -> tuple[str, str] | None:
+        """已挂接正式发送器时，直接 send 也必须经过运行模式、暂停与限速。"""
+        sender = self._official_sender
+        if sender is None:
+            return None
+        gate = getattr(sender, "send_gate", None)
+        if gate is not None and hasattr(gate, "decide"):
+            decision = gate.decide(kind)
+            if not decision.allowed:
+                status = UiaSendStatus.PAUSED if getattr(decision, "paused", False) else UiaSendStatus.REJECTED
+                return status, decision.reason
+        limiter = getattr(sender, "limiter", None)
+        if limiter is not None and hasattr(limiter, "try_acquire"):
+            kind_name = kind if kind in {"auto_reply", "announcement"} else "auto_reply"
+            if not limiter.try_acquire(group_id, kind_name, self.clock.now()):
+                return UiaSendStatus.REJECTED, "已达到限速配额，直接发送被拒绝"
+        return None
+
     def _pause_flag_exists(self) -> bool:
         return self._pause_gate.is_paused()
 
@@ -652,6 +764,8 @@ class UiaOutboundAdapter(OutboundAdapter):
                 return "blocking_dialog", "检测到验证码或异常弹窗，已暂停发送（不自动处理）"
         except UiaError as exc:
             return "ui_not_ready", str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return "ui_not_ready", f"安全探活异常: {exc}"
         return None
 
     def _trigger_pause(self, code: str, message: str) -> None:
@@ -665,7 +779,7 @@ class UiaOutboundAdapter(OutboundAdapter):
     def _record_alert(self, code: str, message: str) -> None:
         payload = {
             "code": code,
-            "message": message,
+            "message": redact(message),
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
         self._alerts.append(payload)
@@ -812,8 +926,11 @@ class UiaSender:
     def last_result(self) -> UiaSendResult | None:
         return self._adapter.last_result
 
-    def send(self, group: str, text: str, *, timeout: float | None = None, send_id: str | None = None) -> UiaSendResult:
-        return self._adapter.send(group, text, timeout=timeout, send_id=send_id)
+    def attach_official_sender(self, sender: object) -> None:
+        self._adapter.attach_official_sender(sender)
+
+    def send(self, group: str, text: str, *, timeout: float | None = None, send_id: str | None = None, **kwargs) -> UiaSendResult:
+        return self._adapter.send(group, text, timeout=timeout, send_id=send_id, **kwargs)
 
     def preheat(self, groups: list[str] | None = None) -> StageTimings:
         return self._adapter.preheat(groups)
@@ -821,5 +938,5 @@ class UiaSender:
     def keep_chat_open(self, group: str | None = None) -> bool:
         return self._adapter.keep_chat_open(group)
 
-    def send_text(self, group_id: str, text: str, *, send_id: str | None = None) -> None:
-        self._adapter.send_text(group_id, text, send_id=send_id)
+    def send_text(self, group_id: str, text: str, *, send_id: str | None = None, **kwargs) -> None:
+        self._adapter.send_text(group_id, text, send_id=send_id, **kwargs)
