@@ -27,6 +27,7 @@ from src.adapters.base import (
     Message,
 )
 from src.adapters.local_db import (
+    CursorCorruptError,
     DbKeyProvider,
     EnvFileKeyProvider,
     LocalDbCorruptError,
@@ -44,6 +45,7 @@ logger = logging.getLogger("wechat_bot.local_capture")
 # 默认轮询 1 秒，抖动 ±0.1 秒，使增量检出延迟尽量落在 1 秒附近。
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_POLL_JITTER = 0.1
+DEFAULT_RECONCILE_INTERVAL = 60.0
 
 
 def extract_local_capture_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -94,10 +96,15 @@ class LocalCaptureAdapter(InboundAdapter):
         rng: random.Random | None = None,
         reader: LocalDbReader | None = None,
         groups: list[Group] | None = None,
+        seen_ids_max: int = 20000,
+        seen_seq_window: int = 10000,
+        reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL,
     ) -> None:
         self._clock: Clock = clock or SystemClock()
         self._interval = max(0.05, float(poll_interval_seconds))
         self._jitter = max(0.0, float(poll_jitter_seconds))
+        self._reconcile_interval = max(0.0, float(reconcile_interval_seconds))
+        self._last_reconcile_at: datetime | None = None
         self._rng = rng or random.Random()
         self._callbacks: list[EventCallback] = []
         self._queue: queue.Queue[Event] = queue.Queue()
@@ -125,6 +132,8 @@ class LocalCaptureAdapter(InboundAdapter):
                 clock=self._clock,
                 key_provider=key_provider,
                 require_key=require_key,
+                seen_ids_max=seen_ids_max,
+                seen_seq_window=seen_seq_window,
             )
         self.scheme = "local_capture"
 
@@ -166,7 +175,11 @@ class LocalCaptureAdapter(InboundAdapter):
         schema = SchemaMapping.from_dict(section.get("schema") or {})
         require_key = bool(section.get("require_key") or section.get("encrypted"))
         key_file = section.get("key_file")  # 仅作路径，不把密钥写进配置
-        provider = key_provider or EnvFileKeyProvider(key_file=key_file)
+        strict = section.get("key_file_strict")
+        provider = key_provider or EnvFileKeyProvider(
+            key_file=key_file,
+            strict=None if strict is None else bool(strict),
+        )
         return cls(
             db_resolved,
             cursor_store=cursor_store,
@@ -182,6 +195,11 @@ class LocalCaptureAdapter(InboundAdapter):
             key_provider=provider,
             require_key=require_key,
             groups=groups,
+            seen_ids_max=int(section.get("seen_ids_max", 20000)),
+            seen_seq_window=int(section.get("seen_seq_window", 10000)),
+            reconcile_interval_seconds=float(
+                section.get("reconcile_interval_seconds", DEFAULT_RECONCILE_INTERVAL)
+            ),
         )
 
     # --- 状态 ---
@@ -295,7 +313,17 @@ class LocalCaptureAdapter(InboundAdapter):
     def poll_once(self, limit: int = 200) -> list[Message]:
         """拉一轮并分发事件。供测试注入，不必启动后台线程。"""
         try:
-            rows = self._reader.poll(limit=limit)
+            rows = list(self._reader.poll(limit=limit))
+            if self._should_reconcile():
+                try:
+                    rows.extend(self._reader.reconcile_recent())
+                except LocalDbError as exc:
+                    logger.warning("定期对账补抓失败: %s", redact(str(exc)))
+                else:
+                    self._last_reconcile_at = self._clock.now()
+        except CursorCorruptError as exc:
+            logger.error("游标损坏且无法回退，已停止抓取以免重放: %s", redact(str(exc)))
+            raise
         except LocalDbLockedError as exc:
             logger.warning("本地库锁定，本轮跳过并等待下次重试: %s", redact(str(exc)))
             raise
@@ -320,12 +348,24 @@ class LocalCaptureAdapter(InboundAdapter):
             )
         return messages
 
+    def _should_reconcile(self) -> bool:
+        if self._reconcile_interval <= 0:
+            return False
+        if self._last_reconcile_at is None:
+            return True
+        now = self._clock.now()
+        elapsed = (now - self._last_reconcile_at).total_seconds()
+        return elapsed >= self._reconcile_interval
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self.poll_once()
             except LocalDbLockedError:
                 pass
+            except CursorCorruptError as exc:
+                logger.error("游标损坏且无法回退，停止轮询以免重放: %s", redact(str(exc)))
+                break
             except LocalDbCorruptError as exc:
                 logger.error("本地库损坏，暂停本轮: %s", redact(str(exc)))
             except Exception as exc:  # noqa: BLE001
