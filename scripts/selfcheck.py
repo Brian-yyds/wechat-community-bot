@@ -93,6 +93,14 @@ def check_rate(config: dict) -> tuple[bool, str]:
         problems.append(f"send_delay_min={lo} 低于 1.5 秒")
     if not (lo < hi <= 8.0):
         problems.append(f"拟人延迟区间 ({lo}, {hi}) 须满足下限 < 上限 ≤ 8")
+    open_lo = float(section.get("open_session_delay_min", 1.5))
+    open_hi = float(section.get("open_session_delay_max", 2.4))
+    if open_lo < 1.5:
+        problems.append(f"open_session_delay_min={open_lo} 低于默认硬约束 1.5 秒（如需更短请确认风险后再改配置）")
+    if not (open_lo < open_hi):
+        problems.append(f"打开会话拟人区间 ({open_lo}, {open_hi}) 非法")
+    if open_hi + 0.5 > 3.0 + 1e-9:
+        problems.append(f"打开会话拟人上限 {open_hi}s + 0.5s 预算超过 3s 端到端目标")
     night = section.get("night_silent") or {}
     policy = str(night.get("auto_reply_policy", "drop"))
     if night.get("enabled", True) and policy != "drop":
@@ -109,7 +117,7 @@ def check_rate(config: dict) -> tuple[bool, str]:
     qpm = section.get("group_per_minute", 3)
     return True, (
         f"限速参数合理（每小时回复上限 {hour}，单群每小时 {group_hour}，"
-        f"每分钟全局 {gpm}/单群 {qpm}，延迟 {lo}–{hi}s）"
+        f"每分钟全局 {gpm}/单群 {qpm}，延迟 {lo}–{hi}s，打开会话 {open_lo}–{open_hi}s）"
     )
 
 

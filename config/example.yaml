@@ -90,6 +90,7 @@ logging:
   level: INFO
 
 # 运行模式：改这一行即可切换。observe / announce / reply。默认 observe。
+# 配置里显式写出的 mode 优先于 data/run_mode.json；运行中切换会写入该状态文件。
 # 紧急暂停：在数据目录放置 PAUSE 文件后，任何发送都不会执行。
 run:
   mode: observe
@@ -110,8 +111,13 @@ rate_limit:
   group_replies_per_hour: 20
   global_per_minute: 8
   group_per_minute: 3
+  # 其余/未打开会话：2–6s（8s 目标）。打开会话规则回复：1.5–2.4s（3s 目标，下限默认 ≥1.5，可配）。
   send_delay_min: 2.0
   send_delay_max: 6.0
+  open_session_delay_min: 1.5
+  open_session_delay_max: 2.4
+  announcement_delay_min: 2.0
+  announcement_delay_max: 6.0
   typing_hook: true
   typing_duration_min: 0.3
   typing_duration_max: 1.0
