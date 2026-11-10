@@ -120,7 +120,7 @@ def test_no_retry_after_press_send(tmp_path: Path):
     adapter = _adapter(tmp_path, driver=driver)
     result = adapter.send("g1", "可能已发出", send_id="msg-maybe")
     assert not result.ok
-    assert result.status == UiaSendStatus.REJECTED
+    assert result.status == UiaSendStatus.MAYBE_SENT
     assert len(driver.pressed) == 1
     # 再次用同一 id 不得重发
     again = adapter.send("g1", "可能已发出", send_id="msg-maybe")
