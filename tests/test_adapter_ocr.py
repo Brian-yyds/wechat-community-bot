@@ -1,0 +1,271 @@
+"""D 方案：OCR 降级发送的单元测试。"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from src.adapters.factory import build_adapter
+from src.adapters.ocr import (
+    CaptchaOrDialogError,
+    DEFAULT_OCR_THRESHOLD,
+    FakeOcrEngine,
+    FakeScreenDriver,
+    GroupNotConfirmedError,
+    OcrFallback,
+    OcrOutboundAdapter,
+    RateLimitedError,
+    SendIdempotencyLog,
+    TextBox,
+    WindowsScreenDriver,
+)
+from src.adapters.pause import PauseGate, SendPausedError
+from src.adapters.roles import IMPLEMENTED_OUTBOUND, OUTBOUND_OCR
+from src.clock import FakeClock
+from src.ratelimit.bucket import BucketSpec, RateLimitConfig, RateLimiter
+
+
+def _limiter(clock: FakeClock, *, capacity: float = 8, refill: float = 10.0) -> RateLimiter:
+    spec = BucketSpec(capacity=capacity, refill_per_second=refill)
+    cfg = RateLimitConfig(
+        global_bucket=spec,
+        per_group=spec,
+        announcement=spec,
+        auto_reply=spec,
+        global_replies_per_hour=40,
+    )
+    return RateLimiter(cfg, clock=clock)
+
+
+def _ready_driver(group: str = "交易会员群-主群") -> FakeScreenDriver:
+    return FakeScreenDriver(
+        elements=[
+            {"text": group, "x": 80, "y": 20, "width": 120, "height": 20, "confidence": 0.99},
+            {"text": "输入", "x": 200, "y": 400, "width": 80, "height": 24, "confidence": 0.99},
+            {"text": "发送", "x": 360, "y": 400, "width": 48, "height": 24, "confidence": 0.99},
+        ]
+    )
+
+
+def test_module_imports_on_linux():
+    assert "src.adapters.ocr" in sys.modules
+
+
+def test_windows_driver_refuses_linux():
+    with pytest.raises(RuntimeError, match="只能在 Windows 上使用"):
+        WindowsScreenDriver()
+
+
+def test_ocr_fallback_high_confidence_not_degraded():
+    ocr = OcrFallback(
+        scripted=[{"text": "请问开户要哪些资料", "confidence": 0.96}],
+        threshold=DEFAULT_OCR_THRESHOLD,
+    )
+    result = ocr.recognize(image=b"fake-image")
+    assert result.confidence >= DEFAULT_OCR_THRESHOLD
+    assert result.fallback_used is False
+    assert ocr.should_fallback(result) is False
+
+
+def test_ocr_fallback_low_confidence_and_empty_and_error():
+    ocr = OcrFallback(
+        scripted=[
+            {"text": "模煳文字", "confidence": 0.21},
+            {"text": "", "confidence": 0.99},
+            {"text": "x", "confidence": 0.0, "error": "engine_failed"},
+        ],
+        threshold=DEFAULT_OCR_THRESHOLD,
+    )
+    low = ocr.recognize(image=b"a")
+    assert low.confidence < DEFAULT_OCR_THRESHOLD
+    assert ocr.should_fallback(low) is True
+    assert low.fallback_used is True
+    assert "ocr_degraded" in low.flags
+
+    empty = ocr.recognize(image=b"blank")
+    assert ocr.should_fallback(empty) is True
+    assert empty.fallback_used is True
+
+    broken = ocr.recognize(image=b"broken")
+    assert ocr.should_fallback(broken) is True
+    assert broken.fallback_used is True
+    assert "ocr_degraded" in broken.flags
+
+
+def test_send_clicks_and_pastes(tmp_path: Path, clock: FakeClock):
+    driver = _ready_driver()
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        engine=FakeOcrEngine(default=__import__("src.adapters.ocr", fromlist=["OcrResult"]).OcrResult(text="交易会员群-主群 输入 发送", confidence=0.99)),
+        limiter=_limiter(clock),
+        data_dir=tmp_path,
+        clock=clock,
+        rng=__import__("random").Random(1),
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.4,
+        input_pause_max=0.4,
+    )
+    adapter.send_text("g1", "测试发送（虚构，请忽略）")
+    assert driver.pastes == ["测试发送（虚构，请忽略）"]
+    assert len(driver.clicks) == 2
+    assert driver.clicks[0] == (240, 412)  # 输入框中心 200+40, 400+12
+    assert driver.clicks[1] == (384, 412)
+    assert adapter.sent_messages[0].text == "测试发送（虚构，请忽略）"
+    assert adapter.history[-1].status == "ok"
+    # 输入停顿被假时钟记录
+    assert any(s >= 0.4 for s in clock.sleeps)
+
+
+def test_dry_run_does_not_click(tmp_path: Path, clock: FakeClock):
+    driver = _ready_driver()
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=_limiter(clock),
+        data_dir=tmp_path,
+        clock=clock,
+        dry_run=True,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    adapter.send_text("g1", "不会真正发送")
+    assert driver.clicks == []
+    assert driver.pastes == []
+    assert adapter.history[-1].status == "dry_run"
+    assert adapter.sent_messages[0].extra.get("dry_run") is True
+
+
+def test_pause_file_blocks_send(tmp_path: Path, clock: FakeClock):
+    driver = _ready_driver()
+    gate = PauseGate(data_dir=tmp_path)
+    gate.pause("人工暂停")
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=_limiter(clock),
+        pause=gate,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    with pytest.raises(SendPausedError, match="紧急暂停"):
+        adapter.send_text("g1", "不应发出")
+    assert driver.clicks == []
+    assert driver.pastes == []
+
+
+def test_captcha_creates_pause_and_stops(tmp_path: Path, clock: FakeClock):
+    driver = FakeScreenDriver(
+        elements=[
+            {"text": "交易会员群-主群", "x": 10, "y": 10, "confidence": 0.99},
+            {"text": "请输入验证码", "x": 80, "y": 80, "confidence": 0.99},
+            {"text": "输入", "x": 20, "y": 400, "confidence": 0.99},
+            {"text": "发送", "x": 80, "y": 400, "confidence": 0.99},
+        ],
+        dialogs=["验证码"],
+    )
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        engine=FakeOcrEngine(scripted=[{"text": "请输入验证码", "confidence": 0.99}]),
+        limiter=_limiter(clock),
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    with pytest.raises(CaptchaOrDialogError, match="验证码"):
+        adapter.send_text("g1", "不应发出")
+    assert (tmp_path / "PAUSE").exists()
+    assert driver.clicks == []
+    assert driver.pastes == []
+
+
+def test_idempotent_does_not_resend(tmp_path: Path, clock: FakeClock):
+    driver = _ready_driver()
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=_limiter(clock),
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    adapter.send_text("g1", "同一句回复")
+    clicks_after_first = list(driver.clicks)
+    adapter.send_text("g1", "同一句回复")
+    assert driver.clicks == clicks_after_first
+    assert adapter.history[-1].status == "skipped_duplicate"
+    assert len(adapter.sent_messages) == 1
+
+
+def test_idempotency_survives_rebuild(tmp_path: Path, clock: FakeClock):
+    log = SendIdempotencyLog(tmp_path / "ocr_idempotency.json", window_seconds=600, clock=clock)
+    log.record("g1", "hello")
+    again = SendIdempotencyLog(tmp_path / "ocr_idempotency.json", window_seconds=600, clock=clock)
+    assert again.already_sent("g1", "hello") is True
+    assert again.already_sent("g1", "other") is False
+
+
+def test_rate_limiter_is_enforced(tmp_path: Path, clock: FakeClock):
+    driver = _ready_driver()
+    limiter = _limiter(clock, capacity=1, refill=0.0)
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=limiter,
+        enforce_rate_limit=True,
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+        max_rate_wait_seconds=1.0,
+    )
+    adapter.send_text("g1", "第一条")
+    with pytest.raises(RateLimitedError):
+        adapter.send_text("g1", "第二条应被限速")
+    assert len(adapter.sent_messages) == 1
+
+
+def test_group_not_confirmed_aborts(tmp_path: Path, clock: FakeClock):
+    driver = FakeScreenDriver(
+        elements=[
+            {"text": "输入", "x": 20, "y": 400, "confidence": 0.99},
+            {"text": "发送", "x": 80, "y": 400, "confidence": 0.99},
+        ]
+    )
+    adapter = OcrOutboundAdapter(
+        driver=driver,
+        limiter=_limiter(clock),
+        data_dir=tmp_path,
+        clock=clock,
+        group_names={"g1": "交易会员群-主群"},
+        input_pause_min=0.0,
+        input_pause_max=0.0,
+    )
+    with pytest.raises(GroupNotConfirmedError, match="确认群名"):
+        adapter.send_text("g1", "不能发错群")
+    assert driver.pastes == []
+
+
+def test_role_is_implemented_and_factory_builds_it(tmp_path: Path, clock: FakeClock, monkeypatch):
+    assert OUTBOUND_OCR in IMPLEMENTED_OUTBOUND
+    monkeypatch.chdir(tmp_path)
+    adapter = build_adapter(
+        {
+            "wechat": {
+                "inbound": "mock",
+                "outbound": "ocr",
+                "ocr": {"dry_run": True, "data_dir": str(tmp_path)},
+            }
+        },
+        clock=clock,
+    )
+    from src.adapters.composite import CompositeAdapter
+
+    assert isinstance(adapter, CompositeAdapter)
+    assert isinstance(adapter.outbound, OcrOutboundAdapter)
