@@ -26,11 +26,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -42,6 +43,9 @@ OPEN_SESSION_TARGET_S = 3.0
 OTHER_TARGET_S = 8.0
 
 LATENCY_JSONL_NAME = "latency.jsonl"
+# 当前文件超过此大小，或跨天时改名为 latency.jsonl.<时间戳>，并清理超过保留天数的旧文件。
+DEFAULT_JSONL_SIZE_LIMIT = 5 * 1024 * 1024
+DEFAULT_JSONL_RETAIN_DAYS = 14
 
 _SEGMENT_KEYS = (
     "detect_delay_s",
@@ -66,6 +70,13 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
     if start is None or end is None:
         return None
     return max(0.0, (end - start).total_seconds())
+
+
+def preview_fingerprint(text: str | None) -> dict[str, Any]:
+    """正文只保留长度与哈希，禁止把明文写入 latency.jsonl。"""
+    raw = text or ""
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return {"chars": len(raw), "sha256": digest}
 
 
 def percentile(values: Sequence[float], p: float) -> float | None:
@@ -107,6 +118,10 @@ class LatencyTrace:
     group_id: str = ""
     kind: str = "auto_reply"
     session_open: bool | None = None
+    chat_was_open: bool | None = None
+    run_mode: str = ""
+    reply_id: str = ""
+    rule_reply: bool = False
     outcome: str = "pending"
     drop_reason: str = ""
     preview: str = ""
@@ -154,16 +169,20 @@ class LatencyTrace:
         }
 
     def to_record(self) -> dict[str, Any]:
-        """转成可落盘的字典；预览等文本会脱敏。"""
+        """转成可落盘的字典；正文只保留长度与哈希，其它文本会脱敏。"""
         segments = self.compute_segments()
         record = {
             "message_id": redact(self.message_id) if self.message_id else "",
             "group_id": redact(self.group_id) if self.group_id else "",
             "kind": self.kind,
             "session_open": self.session_open,
+            "chat_was_open": self.chat_was_open,
+            "run_mode": self.run_mode,
+            "reply_id": self.reply_id,
+            "rule_reply": self.rule_reply,
             "outcome": self.outcome,
             "drop_reason": redact(self.drop_reason) if self.drop_reason else "",
-            "preview": redact(self.preview) if self.preview else "",
+            "preview": preview_fingerprint(self.preview if isinstance(self.preview, str) else ""),
             "message_at": _iso(self.message_at),
             "detected_at": _iso(self.detected_at),
             "classified_at": _iso(self.classified_at),
@@ -184,9 +203,17 @@ class LatencyTrace:
 class LatencyStore:
     """把打点追加写入 JSONL，并提供汇总。"""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        size_limit: int = DEFAULT_JSONL_SIZE_LIMIT,
+        retain_days: int = DEFAULT_JSONL_RETAIN_DAYS,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.size_limit = int(size_limit)
+        self.retain_days = int(retain_days)
         self._lock = threading.Lock()
         self._pending: dict[str, LatencyTrace] = {}
 
@@ -201,11 +228,66 @@ class LatencyStore:
         with self._lock:
             return self._pending.pop(message_id, None)
 
+    def _archived_name(self, when: datetime | None = None) -> Path:
+        stamp = (when or datetime.now()).strftime("%Y%m%d-%H%M%S")
+        return self.path.with_name(f"{self.path.name}.{stamp}")
+
+    def _cleanup_old_files(self, now: datetime | None = None) -> None:
+        if self.retain_days <= 0:
+            return
+        cutoff = (now or datetime.now()) - timedelta(days=self.retain_days)
+        prefix = self.path.name + "."
+        try:
+            entries = list(self.path.parent.iterdir())
+        except OSError:
+            return
+        for item in entries:
+            if not item.is_file() or not item.name.startswith(prefix):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(item.stat().st_mtime)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                try:
+                    item.unlink()
+                except OSError:
+                    continue
+
+    def _rollover_if_needed(self) -> None:
+        """当前文件过大或已跨天时改名归档，并清理过期归档。"""
+        if not self.path.exists():
+            self._cleanup_old_files()
+            return
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return
+        now = datetime.now()
+        too_big = self.size_limit > 0 and stat.st_size >= self.size_limit
+        try:
+            file_day = datetime.fromtimestamp(stat.st_mtime).date()
+        except (OSError, OverflowError, ValueError):
+            file_day = now.date()
+        crossed_day = file_day < now.date()
+        if too_big or crossed_day:
+            dest = self._archived_name(now)
+            idx = 1
+            while dest.exists():
+                dest = self.path.with_name(f"{self.path.name}.{now.strftime('%Y%m%d-%H%M%S')}-{idx}")
+                idx += 1
+            try:
+                self.path.replace(dest)
+            except OSError:
+                return
+        self._cleanup_old_files(now)
+
     def write(self, trace: LatencyTrace) -> dict[str, Any]:
         record = trace.to_record()
         line = json.dumps(record, ensure_ascii=False, default=str)
         with self._lock:
             self._pending.pop(self._key(trace), None)
+            self._rollover_if_needed()
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         return record
@@ -217,8 +299,14 @@ class LatencyStore:
         with self.path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
         return rows
 
     def summarize(self, records: Iterable[Mapping[str, Any]] | None = None) -> dict[str, Any]:
