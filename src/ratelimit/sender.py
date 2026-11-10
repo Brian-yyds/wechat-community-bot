@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import threading
@@ -137,6 +138,8 @@ class HumanizedSender:
         self.sent_count = 0
         self.dropped_count = 0
         self.held_count = 0
+        # 挂到 UIA / 组合适配器上，使直接调用 send/send_text 也无法绕过闸门。
+        self._attach_official_sender()
 
     # --- 供管线 / 调度器调用的接口 ---
 
@@ -343,17 +346,142 @@ class HumanizedSender:
             item.trace.rate_wait_s = item.rate_wait
             item.trace.humanize_delay_s = item.humanize_delay
             item.trace.typing_delay_s = item.typing_delay
-        self.adapter.send_text(item.group_id, item.text)
+        self._invoke_official_send(item)
         finished = self.clock.now()
         adapter_s = max((finished - started).total_seconds(), time_mod.perf_counter() - perf_started)
-        self.sent_count += 1
+        result = self._read_adapter_result()
+        self._copy_uia_timings(item, result)
+        if self._result_counts_as_sent(result):
+            self.sent_count += 1
+            self._finalize_trace(
+                item,
+                outcome="sent",
+                sent_at=finished,
+                adapter_send_s=adapter_s,
+            )
+            return "sent"
+        status = self._result_outcome(result)
+        reason = ""
+        if result is not None:
+            reason = str(getattr(result, "error", "") or "")
         self._finalize_trace(
             item,
-            outcome="sent",
+            outcome=status,
+            reason=reason or status,
             sent_at=finished,
             adapter_send_s=adapter_s,
         )
-        return "sent"
+        return "dropped"
+
+
+    def _attach_official_sender(self) -> None:
+        for target in (self.adapter, getattr(self.adapter, "outbound", None)):
+            if target is None or not hasattr(target, "attach_official_sender"):
+                continue
+            try:
+                target.attach_official_sender(self)
+            except Exception:  # noqa: BLE001
+                self.logger.debug("挂接正式发送闸门失败", exc_info=True)
+
+    def _stable_send_id(self, item: SendItem) -> str:
+        mid = ""
+        if item.trace is not None:
+            mid = str(getattr(item.trace, "message_id", "") or "")
+        if mid:
+            return f"{item.kind.value}:{item.group_id}:{mid}"
+        digest = hashlib.sha256(item.text.encode("utf-8")).hexdigest()[:16]
+        return f"{item.kind.value}:{item.group_id}:{digest}"
+
+    def _invoke_official_send(self, item: SendItem) -> None:
+        send_id = self._stable_send_id(item)
+        try:
+            self.adapter.send_text(
+                item.group_id,
+                item.text,
+                send_id=send_id,
+                through_official=True,
+                kind=item.kind.value,
+            )
+        except TypeError:
+            # MockAdapter 等旧签名只接受 (group_id, text)
+            self.adapter.send_text(item.group_id, item.text)
+
+    def _read_adapter_result(self) -> object | None:
+        adapter = self.adapter
+        result = getattr(adapter, "last_result", None)
+        if result is None:
+            outbound = getattr(adapter, "outbound", None)
+            if outbound is not None:
+                result = getattr(outbound, "last_result", None)
+                if result is None:
+                    inner = getattr(outbound, "adapter", None)
+                    if inner is not None:
+                        result = getattr(inner, "last_result", None)
+        return result
+
+    def _copy_uia_timings(self, item: SendItem, result: object | None) -> None:
+        if result is None or item.trace is None:
+            return
+        direct = getattr(result, "chat_was_open", None)
+        if direct is not None:
+            item.trace.chat_was_open = bool(direct)
+        timings = getattr(result, "timings", None)
+        if timings is None:
+            return
+        data = timings.as_dict() if hasattr(timings, "as_dict") else None
+        if not isinstance(data, dict):
+            return
+        extra = getattr(item.trace, "extra", None)
+        if not isinstance(extra, dict):
+            item.trace.extra = {}
+            extra = item.trace.extra
+        for key in (
+            "open_chat",
+            "paste",
+            "send",
+            "verify",
+            "chat_was_open",
+            "input_pause",
+            "group_switch_wait",
+            "preheat",
+            "adapter_total",
+        ):
+            if key in data:
+                extra[key] = data[key]
+        if data.get("chat_was_open") is not None:
+            flag = bool(data["chat_was_open"])
+            item.trace.session_open = flag
+            item.session_open = flag
+            item.trace.chat_was_open = flag
+
+    def _result_counts_as_sent(self, result: object | None) -> bool:
+        # 没有 last_result 的适配器（如 MockAdapter）保持原成功语义。
+        if result is None:
+            return True
+        if getattr(result, "skipped", False):
+            return False
+        status = str(getattr(result, "status", "") or "").lower()
+        if status in {
+            "maybe_sent",
+            "skipped",
+            "rejected",
+            "failed",
+            "paused",
+            "ui_not_ready",
+            "target_not_found",
+            "timeout",
+            "unknown",
+        }:
+            return False
+        return bool(getattr(result, "ok", False))
+
+    def _result_outcome(self, result: object | None) -> str:
+        if result is None:
+            return "failed"
+        if getattr(result, "skipped", False):
+            return "skipped"
+        status = str(getattr(result, "status", "") or "").strip()
+        return status or "failed"
 
     def _drop_if_blocked(self, item: SendItem, *, stage: str) -> bool:
         """发送出口强制闸门。未注入闸门时不拦截。"""
