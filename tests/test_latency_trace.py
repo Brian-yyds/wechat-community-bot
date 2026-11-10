@@ -228,10 +228,11 @@ def test_jsonl_redacts_sensitive_preview(tmp_path: Path):
     assert "13800138000" not in str(record)
     assert "abcdef123456" not in str(record)
     assert "wxid_secretuser" not in record["message_id"]
+    assert isinstance(record["preview"], dict) and "sha256" in record["preview"]
     line = (tmp_path / "latency.jsonl").read_text(encoding="utf-8")
     assert "13800138000" not in line
-    assert "138****8000" in line or "****" in line
-    # 与日志脱敏规则一致
+    assert "请回电话" not in line
+    assert "wxid_***" in line or "***" in line
     assert redact("token abcdef123456") in line or "***" in line
 
 

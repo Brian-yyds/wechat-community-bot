@@ -148,16 +148,19 @@ def test_send_gate_store_survives_rebuild():
     assert third.allow_auto_reply() is False
 
 
-def test_send_gate_config_explicit_wins_and_corrupt_falls_back_to_observe(tmp_path: Path):
+def test_send_gate_state_wins_over_config_unless_forced(tmp_path: Path):
     path = tmp_path / "run_mode.json"
     gate = SendGate(mode="reply", state_path=path)
     gate.set_mode("reply")
-    # 配置显式为 observe 时，覆盖状态文件
-    explicit = SendGate(mode="observe", state_path=path, config_explicit=True)
-    assert explicit.get_mode() == "observe"
-    # 损坏的状态文件 + 非显式配置 → 回到 observe
+    # 配置仍写 observe、但未 force 时，有效状态优先
+    restored = SendGate(mode="observe", state_path=path, config_explicit=False)
+    assert restored.get_mode() == "reply"
+    # --mode / mode_force 才覆盖状态
+    forced = SendGate(mode="observe", state_path=path, config_explicit=True)
+    assert forced.get_mode() == "observe"
+    # 损坏的状态文件 → 回到 observe
     path.write_text("{not-json", encoding="utf-8")
-    broken = SendGate(mode="observe", state_path=path, config_explicit=False)
+    broken = SendGate(mode="announce", state_path=path, config_explicit=False)
     assert broken.get_mode() == "observe"
     missing = SendGate(state_path=tmp_path / "no-such.json")
     assert missing.get_mode() == "observe"
@@ -170,3 +173,31 @@ def test_atomic_write_json_roundtrip(tmp_path: Path):
     assert read_json(tmp_path / "missing.json", default={"x": 1}) == {"x": 1}
     path.write_text("???")
     assert read_json(path, default={"bad": True}) == {"bad": True}
+
+
+def test_latency_preview_is_fingerprint_and_skips_bad_lines(tmp_path: Path):
+    from src.latency import LatencyStore, LatencyTrace
+
+    store = LatencyStore(tmp_path / "latency.jsonl")
+    body = "今天行情怎么看？有没有风险提示，我想了解一下开户流程。"
+    rec = store.write(LatencyTrace(message_id="m1", preview=body, run_mode="reply", rule_reply=True, reply_id="greeting"))
+    assert body not in (tmp_path / "latency.jsonl").read_text(encoding="utf-8")
+    assert rec["preview"]["chars"] == len(body)
+    assert rec["run_mode"] == "reply"
+    assert rec["rule_reply"] is True
+    path = tmp_path / "latency.jsonl"
+    path.write_text("{bad\n" + path.read_text(encoding="utf-8") + "{\n", encoding="utf-8")
+    rows = LatencyStore(path).read_all()
+    assert any(r.get("message_id") == "m1" for r in rows)
+
+
+def test_latency_jsonl_rolls_over_when_over_size_limit(tmp_path: Path):
+    from src.latency import LatencyStore, LatencyTrace
+
+    path = tmp_path / "latency.jsonl"
+    store = LatencyStore(path, size_limit=80, retain_days=14)
+    store.write(LatencyTrace(message_id="a", preview="x" * 40))
+    store.write(LatencyTrace(message_id="b", preview="y" * 40))
+    archived = list(tmp_path.glob("latency.jsonl.*"))
+    assert archived, "超过 size_limit 后应把旧文件改名归档"
+    assert path.exists()
