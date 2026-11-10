@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 from collections.abc import Callable
 from typing import Any
 
@@ -52,9 +54,21 @@ def build_adapter(
         if isinstance(candidate, dict):
             notify_cfg.update(candidate)
     assist_wanted = bool(notify_cfg.get("enabled")) or str(section.get("assist") or "").strip() == INBOUND_NOTIFICATION
+    # 与文档 / example 默认值一致：未写时视为 True。
+    if "wake_a_on_preview" in notify_cfg:
+        wake_a_on_preview = bool(notify_cfg.get("wake_a_on_preview"))
+    else:
+        wake_a_on_preview = True
     # 主读取已经是 notification 时不必再挂一份。
     if inbound_name == INBOUND_NOTIFICATION:
         assist_wanted = False
+        warnings.warn(
+            "wechat.inbound=notification 不能作为唯一消息源。"
+            "预览可能被截断，只应用于唤醒或记录；请与 local_capture 组合。"
+            "管线不会对 partial=True 的预览自动回复。",
+            UserWarning,
+            stacklevel=2,
+        )
 
     if (
         inbound_name == INBOUND_MOCK
@@ -82,11 +96,13 @@ def build_adapter(
             clock=clock,
             config=config,
         )
-        if wake_target is None and inbound_name != INBOUND_NOTIFICATION:
-            wake_target = inbound
-        if wake_callback is None and notify_cfg.get("wake_a_on_preview", True):
-            # CompositeAdapter 会按 wake_target 生成默认唤醒回调。
-            pass
+        # 只有 wake_a_on_preview=true（默认）时才自动把唤醒钩子接到 A。
+        # 为 false 时不得设置 wake_target，也不得给通知适配器挂默认回调。
+        if wake_a_on_preview:
+            if wake_target is None and inbound_name != INBOUND_NOTIFICATION:
+                wake_target = inbound
+        elif wake_callback is None:
+            wake_target = None
 
     if inbound is outbound and notification is None and wake_callback is None and wake_target is None:
         return inbound  # type: ignore[return-value]

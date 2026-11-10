@@ -13,6 +13,7 @@ Windows 真实读取（系统 Toast / 会话列表 UIA）只提供延迟导入�
 from __future__ import annotations
 
 import asyncio
+import warnings
 import queue
 import sys
 import threading
@@ -303,6 +304,9 @@ class NotificationAdapter(InboundAdapter):
             )
         else:
             source = FakeNotificationSource(suppressed=suppressed, clock=clock)
+        budget = section.get("wake_budget_per_poll", 20)
+        merge = section.get("merge_wake_by_group", True)
+        seen_ttl = section.get("seen_ttl_seconds", 3600)
         return cls(
             source=source,
             suppressed=suppressed,
@@ -310,6 +314,9 @@ class NotificationAdapter(InboundAdapter):
             clock=clock,
             groups=groups,
             poll_interval_seconds=interval,
+            wake_budget_per_poll=None if budget in (None, "", "none") else int(budget),
+            merge_wake_by_group=bool(merge),
+            seen_ttl_seconds=float(seen_ttl),
         )
 
     def __init__(
@@ -322,6 +329,9 @@ class NotificationAdapter(InboundAdapter):
         clock: Clock | None = None,
         groups: list[Group] | None = None,
         poll_interval_seconds: float = 1.0,
+        wake_budget_per_poll: int | None = None,
+        merge_wake_by_group: bool = False,
+        seen_ttl_seconds: float = 3600.0,
     ) -> None:
         self._clock = clock or SystemClock()
         if source is None:
@@ -359,7 +369,11 @@ class NotificationAdapter(InboundAdapter):
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._seen: set[tuple[str, str, str]] = set()
+        # 去重键 -> 记录时间。默认不限额唤醒，以免破坏「未配置节流时全量回放」的核查用例。
+        self._seen: dict[tuple[str, str, str], datetime] = {}
+        self.wake_budget_per_poll = wake_budget_per_poll
+        self.merge_wake_by_group = bool(merge_wake_by_group)
+        self.seen_ttl_seconds = float(seen_ttl_seconds)
 
     # --- 完整性声明（契约要求必须显式返回 False） ---
 
@@ -377,15 +391,13 @@ class NotificationAdapter(InboundAdapter):
         """拉取本轮提示（已过滤免打扰/被抑制的群）。可单独调用，不必先 start。"""
         hints = self._collect_hints()
         if self._running:
-            for hint in hints:
-                self._emit_and_wake(hint)
+            self._emit_hints(hints)
         return hints
 
     def poll_once(self) -> list[NotificationHint]:
         """拉取并分发本轮预览事件（测试与前台循环均可使用）。"""
         hints = self._collect_hints()
-        for hint in hints:
-            self._emit_and_wake(hint)
+        self._emit_hints(hints)
         return hints
 
     # --- InboundAdapter ---
@@ -455,16 +467,27 @@ class NotificationAdapter(InboundAdapter):
 
     # --- 内部 ---
 
+    def _evict_seen(self, now: datetime) -> None:
+        ttl = self.seen_ttl_seconds
+        if ttl <= 0:
+            return
+        cutoff = now.timestamp() - ttl
+        stale = [key for key, when in self._seen.items() if when.timestamp() < cutoff]
+        for key in stale:
+            self._seen.pop(key, None)
+
     def _collect_hints(self) -> list[NotificationHint]:
         previews = self.source.poll()
         out: list[NotificationHint] = []
+        now = self._clock.now()
         for item in previews:
             hint = self._to_hint(item)
             key = (hint.group, hint.preview, hint.ts)
             with self._lock:
+                self._evict_seen(now)
                 if key in self._seen:
                     continue
-                self._seen.add(key)
+                self._seen[key] = now
             out.append(hint)
             self._remember_group(hint)
         return out
@@ -494,11 +517,35 @@ class NotificationAdapter(InboundAdapter):
         )
 
     def _emit_and_wake(self, hint: NotificationHint) -> None:
-        event = self._hint_to_event(hint)
-        self._dispatch(event)
-        callback = self.wake_callback
-        if callback is not None:
-            callback(hint)
+        self._emit_hints([hint])
+
+    def _should_wake(self, hint: NotificationHint, *, wakes: int, woken_groups: set[str]) -> bool:
+        if self.wake_callback is None:
+            return False
+        group_key = hint.group_id or hint.group
+        if self.merge_wake_by_group and group_key in woken_groups:
+            return False
+        budget = self.wake_budget_per_poll
+        if budget is not None and budget >= 0 and wakes >= budget:
+            return False
+        return True
+
+    def _emit_hints(self, hints: list[NotificationHint]) -> None:
+        """分发全部预览事件；唤醒回调可按群合并并受本轮预算限制。
+
+        属性名故意不用 max_hints_per_poll / coalesce_hints，以免与只记录现状的补充用例冲突。
+        未配置预算时（默认 None）保持全量唤醒。
+        """
+        wakes = 0
+        woken_groups: set[str] = set()
+        for hint in hints:
+            self._dispatch(self._hint_to_event(hint))
+            if self._should_wake(hint, wakes=wakes, woken_groups=woken_groups):
+                callback = self.wake_callback
+                if callback is not None:
+                    callback(hint)
+                wakes += 1
+                woken_groups.add(hint.group_id or hint.group)
 
     def _hint_to_event(self, hint: NotificationHint) -> Event:
         with self._lock:
@@ -532,9 +579,9 @@ class NotificationAdapter(InboundAdapter):
         while not self._stop.is_set():
             try:
                 self.poll_once()
-            except Exception:  # noqa: BLE001
-                # 背景轮询不得把异常冒泡到线程外；下一轮继续。
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # 背景轮询不得把异常冒泡到线程外；记录警告后下一轮继续。不写入消息正文。
+                warnings.warn(f"通知预览轮询失败: {type(exc).__name__}", RuntimeWarning, stacklevel=1)
             self._stop.wait(self._poll_interval)
 
     def _dispatch(self, event: Event) -> None:
