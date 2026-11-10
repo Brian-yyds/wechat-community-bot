@@ -142,6 +142,7 @@ def build_app(
     clock: Clock | None = None,
     rng: Random | None = None,
     data_dir: Path | None = None,
+    force_mode: str | None = None,
 ) -> dict[str, Any]:
     clock = clock or SystemClock()
     bot_cfg = config.get("bot") or {}
@@ -152,15 +153,18 @@ def build_app(
 
     run_cfg = config.get("run") or {}
     mode_raw = run_cfg.get("mode")
-    # 配置文件显式写了 run.mode 时以配置为准；否则尝试恢复状态文件。
-    config_explicit = "mode" in run_cfg and mode_raw not in (None, "")
+    # 优先级：有效状态文件 > 配置 run.mode > 默认 observe。
+    # --mode 或 run.mode_force=true 才会覆盖已有状态。
+    mode_force = bool(run_cfg.get("mode_force")) or force_mode not in (None, "")
+    if force_mode not in (None, ""):
+        mode_raw = force_mode
     try:
-        run_mode = parse_run_mode(mode_raw if config_explicit else None)
+        run_mode = parse_run_mode(mode_raw)
     except RunModeError as exc:
         # 非法配置默认安全：回到 observe 继续只读运行，而不是拒绝启动。
         logging.getLogger("wechat_bot").warning("非法运行模式，已回退到 observe: %s", exc)
         run_mode = parse_run_mode("observe")
-        config_explicit = True
+        mode_force = True
     pause_gate = PauseGate(data_dir=data_dir)
     latency_raw = (config.get("pipeline") or {}).get("latency_path")
     latency_path = Path(latency_raw) if latency_raw else (data_dir / LATENCY_JSONL_NAME)
@@ -171,7 +175,7 @@ def build_app(
         mode=run_mode,
         pause_gate=pause_gate,
         state_path=data_dir / "run_mode.json",
-        config_explicit=config_explicit,
+        config_explicit=mode_force,
     )
 
     groups = []
@@ -280,6 +284,7 @@ def run_demo(
     fire_announcement: bool = True,
     inject: list[dict[str, Any]] | None = None,
     demo_fast: bool = True,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """跑通「注入消息 → 分类 → 自动回复 → 定时公告 → 限速发出」的演示。"""
     project_root = project_root or project_root_from_here()
@@ -302,9 +307,10 @@ def run_demo(
         rate["night_silent"] = night
         config = dict(config)
         config["rate_limit"] = rate
-        # 演示必须实际发出，才能看完自动回复和公告；示例配置默认是 observe。
+        # 演示必须实际发出，才能看完自动回复和公告。用 mode_force 覆盖可能残留的状态文件。
         run = dict(config.get("run") or {})
         run["mode"] = "reply"
+        run["mode_force"] = True
         config["run"] = run
 
     if clock is None:
@@ -312,7 +318,14 @@ def run_demo(
     if rng is None:
         rng = Random(2026)
 
-    app = build_app(config, project_root=project_root, clock=clock, rng=rng, data_dir=data_dir)
+    app = build_app(
+        config,
+        project_root=project_root,
+        clock=clock,
+        rng=rng,
+        data_dir=data_dir,
+        force_mode=mode,
+    )
     adapter: MockAdapter = app["adapter"]
     sender: HumanizedSender = app["sender"]
     scheduler: AnnouncementScheduler = app["scheduler"]
@@ -407,6 +420,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=None, help="配置文件路径（toml/json/yaml）")
     parser.add_argument("--data-dir", type=str, default=None, help="数据目录（JSONL 与调度状态）")
     parser.add_argument("--json", action="store_true", help="演示结果以 JSON 打印")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=None,
+        help="强制运行模式 observe/announce/reply，覆盖状态文件与配置（等同 run.mode_force）",
+    )
     return parser.parse_args(argv)
 
 
@@ -417,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         data_dir = Path(args.data_dir) if args.data_dir else None
-        summary = run_demo(config_path=args.config, data_dir=data_dir)
+        summary = run_demo(config_path=args.config, data_dir=data_dir, mode=args.mode)
     except ForbiddenContentError as exc:
         print(f"已停止：{exc}", file=sys.stderr)
         return 3

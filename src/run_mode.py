@@ -14,7 +14,9 @@
 不允许的发送一律丢弃并记日志。
 
 运行模式可写入共享 store 或 ``data/run_mode.json``，重启后恢复。
-配置文件里显式设置的 ``run.mode`` 优先于状态文件；状态文件缺失或损坏时回到 observe。
+优先级：运行时写入且有效的状态文件 > 配置里的 ``run.mode`` > 默认 observe。
+命令行 ``--mode`` 或配置 ``run.mode_force=true`` 才会用配置/参数覆盖状态文件。
+状态文件缺失或损坏、以及非法模式，均告警并回到 observe，不拒绝启动。
 """
 
 from __future__ import annotations
@@ -109,8 +111,8 @@ class SendGate:
     未注入闸门时，发送器保持原有行为（允许发送），以免破坏既有单测。
     由 ``build_app`` 根据配置装配闸门后，默认模式为 observe。
 
-    运行时 ``set_mode`` 会写入 store 与状态文件，重建时可恢复。
-    若 ``config_explicit=True``，则以配置文件中的模式为准。
+    运行时 ``set_mode`` 会写入 store 与状态文件，重建时可恢复（状态优先于配置）。
+    仅当 ``config_explicit=True``（对应 ``--mode`` / ``run.mode_force``）时，才用传入的 mode 覆盖状态。
     """
 
     def __init__(
