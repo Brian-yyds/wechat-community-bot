@@ -644,6 +644,10 @@ class CursorStore:
             "last_seq": int(self._data.get("last_seq") or 0),
             "seen_ids": list(self._data.get("seen_ids") or []),
             "file_identity": dict(self._data.get("file_identity") or {}),
+            "watermark_seq": int(self._data.get("watermark_seq") or 0),
+            "watermark_ts": str(self._data.get("watermark_ts") or ""),
+            "gate_ts": str(self._data.get("gate_ts") or ""),
+            "apply_ts_watermark": bool(self._data.get("apply_ts_watermark") or False),
         }
 
     def _fingerprint(self, last_seq: int, seen_ids: list[str], identity: dict[str, int] | None) -> tuple[Any, ...]:
@@ -652,7 +656,13 @@ class CursorStore:
         # 同时若集合中间变化也会因 count/首尾不同而写出。
         head = tuple(seen_ids[:3])
         tail = tuple(seen_ids[-3:]) if len(seen_ids) > 3 else ()
-        return (int(last_seq), len(seen_ids), head, tail, ident)
+        wm = (
+            int(self._data.get("watermark_seq") or 0),
+            str(self._data.get("watermark_ts") or ""),
+            str(self._data.get("gate_ts") or ""),
+            bool(self._data.get("apply_ts_watermark") or False),
+        )
+        return (int(last_seq), len(seen_ids), head, tail, ident, wm)
 
     def save(
         self,
@@ -661,6 +671,10 @@ class CursorStore:
         identity: dict[str, int] | None,
         *,
         flush: bool = True,
+        watermark_seq: int | None = None,
+        watermark_ts: str | None = None,
+        gate_ts: str | None = None,
+        apply_ts_watermark: bool | None = None,
     ) -> None:
         self._data["last_seq"] = int(last_seq)
         # 契约测试会把同一个 dict 注入重建后的读取器，list / set 均可。
@@ -673,6 +687,14 @@ class CursorStore:
             self._data["seen_ids"] = ids
         if identity:
             self._data["file_identity"] = dict(identity)
+        if watermark_seq is not None:
+            self._data["watermark_seq"] = int(watermark_seq)
+        if watermark_ts is not None:
+            self._data["watermark_ts"] = str(watermark_ts)
+        if gate_ts is not None:
+            self._data["gate_ts"] = str(gate_ts)
+        if apply_ts_watermark is not None:
+            self._data["apply_ts_watermark"] = bool(apply_ts_watermark)
         if self._path is None or not flush:
             return
         fp = self._fingerprint(int(last_seq), ids, identity)
@@ -688,6 +710,10 @@ class CursorStore:
             "last_seq": int(last_seq),
             "seen_ids": list(seen_ids),
             "file_identity": dict(identity),
+            "watermark_seq": int(self._data.get("watermark_seq") or 0),
+            "watermark_ts": str(self._data.get("watermark_ts") or ""),
+            "gate_ts": str(self._data.get("gate_ts") or ""),
+            "apply_ts_watermark": bool(self._data.get("apply_ts_watermark") or False),
         }
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -750,6 +776,36 @@ def parse_timestamp(value: Any, *, fallback: datetime | None = None) -> datetime
         return fallback if fallback is not None else datetime.now()
 
 
+def try_parse_timestamp(value: Any) -> datetime | None:
+    """解析时间戳；失败返回 None，不回退到当前时间。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is not None:
+            return dt.astimezone(SHANGHAI).replace(tzinfo=None)
+        return dt
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        try:
+            return datetime.fromtimestamp(ts)
+        except (OSError, OverflowError, ValueError):
+            return None
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            return dt.astimezone(SHANGHAI).replace(tzinfo=None)
+        return dt
+    except ValueError:
+        return None
+
+
 def format_placeholder(msg_type: Any) -> str:
     label = "未知类型" if msg_type in (None, "") else str(msg_type)
     return f"[非文本消息:{label}]"
@@ -800,6 +856,10 @@ class LocalDbReader:
         self._seen_order: list[str] = list(dict.fromkeys(str(x) for x in snap["seen_ids"]))
         self._seen_seq: dict[str, int] = {}
         self._file_identity: dict[str, int] = dict(snap.get("file_identity") or {})
+        self._watermark_seq = int(snap.get("watermark_seq") or 0)
+        self._watermark_ts = try_parse_timestamp(snap.get("watermark_ts"))
+        self._gate_ts = try_parse_timestamp(snap.get("gate_ts"))
+        self._apply_ts_watermark = bool(snap.get("apply_ts_watermark") or False)
         self._missing_warned = False
         self._io_lock = threading.RLock()
         self._freeze_trim = False
@@ -819,7 +879,15 @@ class LocalDbReader:
     # --- 游标 ---
 
     def get_cursor(self) -> dict[str, Any]:
-        return {"last_seq": self._last_seq, "seen_ids": set(self._seen_ids), "file_identity": dict(self._file_identity)}
+        return {
+            "last_seq": self._last_seq,
+            "seen_ids": set(self._seen_ids),
+            "file_identity": dict(self._file_identity),
+            "watermark_seq": int(self._watermark_seq),
+            "watermark_ts": self._format_ts(self._watermark_ts),
+            "gate_ts": self._format_ts(self._gate_ts),
+            "apply_ts_watermark": bool(self._apply_ts_watermark),
+        }
 
     def set_cursor(self, cursor: Mapping[str, Any]) -> None:
         self._last_seq = int(cursor.get("last_seq") or 0)
@@ -827,20 +895,74 @@ class LocalDbReader:
         self._seen_order = list(dict.fromkeys(str(x) for x in (cursor.get("seen_ids") or [])))
         self._seen_seq = {}
         self._file_identity = dict(cursor.get("file_identity") or {})
+        # 未给出水位线字段时保留当前值，避免对账测试里的部分更新清掉门闩。
+        if "watermark_seq" in cursor:
+            self._watermark_seq = int(cursor.get("watermark_seq") or 0)
+        if "watermark_ts" in cursor:
+            self._watermark_ts = try_parse_timestamp(cursor.get("watermark_ts"))
+        if "gate_ts" in cursor:
+            self._gate_ts = try_parse_timestamp(cursor.get("gate_ts"))
+        if "apply_ts_watermark" in cursor:
+            self._apply_ts_watermark = bool(cursor.get("apply_ts_watermark"))
         self._persist(flush=True)
 
-    def _persist(self, *, flush: bool = True) -> None:
-        self._store.save(self._last_seq, self._seen_ids, self._file_identity, flush=flush)
+    def _format_ts(self, value: datetime | None) -> str:
+        if value is None:
+            return ""
+        return value.isoformat(timespec="microseconds")
 
-    def _remember(self, msg_id: str, seq: int) -> None:
+    def _persist(self, *, flush: bool = True) -> None:
+        self._store.save(
+            self._last_seq,
+            self._seen_ids,
+            self._file_identity,
+            flush=flush,
+            watermark_seq=self._watermark_seq,
+            watermark_ts=self._format_ts(self._watermark_ts),
+            gate_ts=self._format_ts(self._gate_ts),
+            apply_ts_watermark=self._apply_ts_watermark,
+        )
+
+    def _remember(self, msg_id: str, seq: int, ts: datetime | None = None) -> None:
         if msg_id not in self._seen_ids:
             self._seen_order.append(msg_id)
         self._seen_ids.add(msg_id)
         self._seen_seq[msg_id] = int(seq)
+        self._advance_watermark(seq, ts)
+
+    def _advance_watermark(self, seq: int, ts: datetime | None) -> None:
+        if int(seq) > self._watermark_seq:
+            self._watermark_seq = int(seq)
+        if ts is not None and (self._watermark_ts is None or ts > self._watermark_ts):
+            self._watermark_ts = ts
+
+    def _ignore_before_watermark(self, raw: Mapping[str, Any]) -> tuple[bool, datetime | None]:
+        """库文件替换后，水位线之前（含相等）或无法解析时间戳的未见消息应忽略。
+
+        正常增量路径不启用时间戳门闩，以免漏掉乱序但较早时间戳的新消息。
+        """
+        ts = try_parse_timestamp(raw.get("ts"))
+        if not self._apply_ts_watermark or self._gate_ts is None:
+            return False, ts
+        if ts is None or ts <= self._gate_ts:
+            return True, ts
+        return False, ts
+
+    def _log_ignored_before_watermark(self, count: int, example_id: str | None) -> None:
+        if count <= 0:
+            return
+        logger.info(
+            "库文件替换/重建后忽略水位线之前的未见消息 %s 条（不重放，交由对账），例如 id=%s gate_ts=%s",
+            count,
+            example_id or "",
+            self._format_ts(self._gate_ts),
+        )
 
     def trim_seen_window(self) -> None:
         """按最大条数与序号窗裁剪去重集。库文件替换后冻结裁剪，以免丢掉历史 ID。
 
+        裁剪只收缩 seen_ids，不降低已处理的水位线（watermark_seq / watermark_ts）。
+        库文件替换后靠时间戳门闩只放行水位线之后的消息；水位线之前的未见 ID 忽略并记日志，由对账而不是重放。
         方法名不用 prune / prune_seen_ids，以免与核查中记录「尚无该接口」的估算用例冲突。
         """
         if self._freeze_trim:
@@ -912,8 +1034,13 @@ class LocalDbReader:
             )
             self._last_seq = 0
             self._file_identity = ident
-            # 库被替换时保留完整去重集，并冻结窗口裁剪，避免历史 ID 被剪掉后重放。
+            # 库被替换时保留完整去重集，并冻结窗口裁剪，避免仍在窗口内的历史 ID 被剪掉后重放。
             self._freeze_trim = True
+            # 序号空间已重置，旧 watermark_seq 不再适用；用替换前的最大时间戳作为门闩，
+            # 只放行之后的消息。已被裁剪的历史 ID 因此不会因库文件重建而被重放。
+            self._gate_ts = self._watermark_ts
+            self._apply_ts_watermark = self._gate_ts is not None
+            self._watermark_seq = 0
             self._persist(flush=True)
             return
         self._file_identity = ident
@@ -986,6 +1113,8 @@ class LocalDbReader:
         remaining = max(int(limit), 1)
         detected_at = self._now()
         safety_rounds = 0
+        ignored_before_watermark = 0
+        ignored_example = None
         while remaining > 0 and safety_rounds < 10000:
             safety_rounds += 1
             batch_limit = max(remaining, int(limit))
@@ -1004,7 +1133,13 @@ class LocalDbReader:
                 if not self._allowed(str(raw.get("group_id") or "")):
                     # 非白名单群：仍然推进游标，但不计入已见，避免误把白名单外的 ID 污染去重集。
                     continue
-                self._remember(msg_id, seq)
+                ignore, ts = self._ignore_before_watermark(raw)
+                if ignore:
+                    ignored_before_watermark += 1
+                    if ignored_example is None:
+                        ignored_example = msg_id
+                    continue
+                self._remember(msg_id, seq, ts)
                 out.append(self._row_to_msg(raw, detected_at=detected_at))
                 remaining -= 1
                 if remaining <= 0:
@@ -1015,6 +1150,7 @@ class LocalDbReader:
             if remaining <= 0:
                 break
             # 本批全被过滤时继续拉下一批，直到没有进度。
+        self._log_ignored_before_watermark(ignored_before_watermark, ignored_example)
         self.trim_seen_window()
         self._persist(flush=True)
         return out
@@ -1033,17 +1169,26 @@ class LocalDbReader:
             return []
         detected_at = self._now()
         out: list[dict[str, Any]] = []
+        ignored_before_watermark = 0
+        ignored_example = None
         for raw in self._reader.fetch_by_ids(msg_ids):
             msg_id = str(raw["msg_id"])
             if msg_id in self._seen_ids:
                 continue
             if not self._allowed(str(raw.get("group_id") or "")):
                 continue
+            ignore, ts = self._ignore_before_watermark(raw)
+            if ignore:
+                ignored_before_watermark += 1
+                if ignored_example is None:
+                    ignored_example = msg_id
+                continue
             seq = int(raw["create_seq"])
-            self._remember(msg_id, seq)
+            self._remember(msg_id, seq, ts)
             if seq > self._last_seq:
                 self._last_seq = seq
             out.append(self._row_to_msg(raw, detected_at=detected_at))
+        self._log_ignored_before_watermark(ignored_before_watermark, ignored_example)
         self.trim_seen_window()
         self._persist(flush=True)
         return out
