@@ -42,6 +42,21 @@ class ProcessResult:
     trace: LatencyTrace | None = None
 
 
+
+def is_partial_preview(message: Message, extra: dict | None = None) -> bool:
+    """截断预览（如通知旁路）只用于唤醒/记录，不得拿去自动回复。"""
+    merged: dict = {}
+    if message.extra:
+        merged.update(message.extra)
+    if extra:
+        merged.update(extra)
+    if merged.get("partial") is True:
+        return True
+    if merged.get("source") == "notification" and merged.get("complete") is False:
+        return True
+    return False
+
+
 class Pipeline:
     """完整处理一条群消息事件。"""
 
@@ -80,7 +95,12 @@ class Pipeline:
         if event.extra:
             if "session_open" in event.extra:
                 session_open = bool(event.extra["session_open"])
-        return self.process(event.message, detected_at=event.timestamp, session_open=session_open)
+        return self.process(
+            event.message,
+            detected_at=event.timestamp,
+            session_open=session_open,
+            event_extra=event.extra,
+        )
 
     def process(
         self,
@@ -88,6 +108,7 @@ class Pipeline:
         *,
         detected_at: datetime | None = None,
         session_open: bool | None = None,
+        event_extra: dict | None = None,
     ) -> ProcessResult:
         now = self.clock.now()
         detected = detected_at or now
@@ -108,6 +129,26 @@ class Pipeline:
             self.latency_store.remember(trace)
 
         decision_started = time.perf_counter()
+        if is_partial_preview(message, event_extra):
+            trace.decided_at = self.clock.now()
+            trace.decision_s = time.perf_counter() - decision_started
+            trace.outcome = "partial_preview"
+            result = ProcessResult(
+                message=message,
+                duplicate=False,
+                category=None,
+                extraction=None,
+                reply_id=None,
+                reply_text=None,
+                record=self._record(message, duplicate=False, skip_reason="partial_preview"),
+                skipped=True,
+                skip_reason="partial_preview",
+                trace=trace,
+            )
+            self._emit(result)
+            self._flush_trace_if_idle(trace)
+            return result
+
         if self.dedup.is_duplicate(message):
             trace.decided_at = self.clock.now()
             trace.decision_s = time.perf_counter() - decision_started
