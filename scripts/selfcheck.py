@@ -104,7 +104,84 @@ def check_rate(config: dict) -> tuple[bool, str]:
             problems.append(f"公告 {item.get('id')} jitter_seconds={jitter} 超过准点 ±5 秒窗口")
     if problems:
         return False, "；".join(problems)
-    return True, f"限速参数合理（每小时回复上限 {hour}，延迟 {lo}–{hi}s）"
+    group_hour = section.get("group_replies_per_hour", 20)
+    gpm = section.get("global_per_minute", 8)
+    qpm = section.get("group_per_minute", 3)
+    return True, (
+        f"限速参数合理（每小时回复上限 {hour}，单群每小时 {group_hour}，"
+        f"每分钟全局 {gpm}/单群 {qpm}，延迟 {lo}–{hi}s）"
+    )
+
+
+def check_latency(root: Path, data_dir: Path) -> tuple[bool, str]:
+    """用 Mock 端到端打出延迟分段，对照决策 <100ms 与 3s/8s 目标（拟人延迟单独列出）。"""
+    sys.path.insert(0, str(root))
+    from datetime import datetime, timedelta
+    from random import Random
+
+    from src.clock import FakeClock
+    from src.config_util import load_config
+    from src.latency import DECISION_TARGET_S, format_summary
+    from src.main import build_app
+
+    try:
+        config = load_config(root / "config" / "example.toml", project_root=root)
+        config = dict(config)
+        config["run"] = {"mode": "reply"}
+        rate = dict(config.get("rate_limit") or {})
+        night = dict(rate.get("night_silent") or {})
+        night["enabled"] = False
+        rate["night_silent"] = night
+        rate["typing_hook"] = False
+        config["rate_limit"] = rate
+
+        clock = FakeClock(datetime(2026, 11, 11, 10, 0, 0))
+        app = build_app(
+            config,
+            project_root=root,
+            clock=clock,
+            rng=Random(1),
+            data_dir=data_dir,
+        )
+        adapter = app["adapter"]
+        sender = app["sender"]
+        pipeline = app["pipeline"]
+        adapter.start()
+        # 第一条：会话已打开；消息时间早于检出，用于观察检出延迟。
+        earlier = clock.now() - timedelta(seconds=0.4)
+        adapter.inject_message(
+            "你好，在吗？",
+            sender_name="会员甲",
+            sender_id="user-001",
+            timestamp=earlier,
+            extra={"session_open": True},
+        )
+        # Mock 适配器的事件时间等于消息时间，再走管线补一次带检出时点的样本。
+        from src.adapters.base import Message
+
+        msg = Message(
+            message_id="selfcheck-open",
+            group_id="demo-group",
+            sender_id="user-005",
+            content="请问开户需要准备什么资料？",
+            timestamp=clock.now() - timedelta(seconds=0.8),
+            sender_name="会员丁",
+            extra={"session_open": True},
+        )
+        pipeline.process(msg, detected_at=clock.now(), session_open=True)
+        sender.pump()
+        adapter.stop()
+        summary = app["latency_store"].summarize()
+        text_out = format_summary(summary)
+        decision = ((summary.get("all") or {}).get("by_segment") or {}).get("decision_s") or {}
+        decision_max = decision.get("max")
+        if summary.get("count", 0) <= 0 or decision_max is None:
+            return False, "未产生延迟打点；" + text_out
+        if decision_max >= DECISION_TARGET_S:
+            return False, text_out
+        return True, text_out
+    except Exception as exc:  # noqa: BLE001
+        return False, f"延迟打点失败: {exc}"
 
 
 def check_demo(root: Path, data_dir: Path) -> tuple[bool, str]:
@@ -157,8 +234,16 @@ def main(argv: list[str] | None = None) -> int:
             data_dir = root / data_dir
         demo_ok, demo_msg = check_demo(root, data_dir / "selfcheck")
     print(("OK  " if demo_ok else "FAIL"), "演示:", demo_msg)
+    lat_ok, lat_msg = (False, "跳过")
+    if py_ok and cfg_ok and dir_ok:
+        bot = config.get("bot") or {}
+        data_dir = Path(bot.get("data_dir") or "data")
+        if not data_dir.is_absolute():
+            data_dir = root / data_dir
+        lat_ok, lat_msg = check_latency(root, data_dir / "selfcheck" / "latency")
+    print(("OK  " if lat_ok else "FAIL"), "延迟:", lat_msg)
 
-    ok = all([py_ok, dep_ok, cfg_ok, dir_ok, rate_ok, demo_ok])
+    ok = all([py_ok, dep_ok, cfg_ok, dir_ok, rate_ok, demo_ok, lat_ok])
     print("======== 自检", "通过" if ok else "未通过", "========")
     return 0 if ok else 1
 
