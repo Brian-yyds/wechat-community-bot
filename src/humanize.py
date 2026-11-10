@@ -82,7 +82,7 @@ class HumanizeProfiles:
     other: tuple[float, float] = DEFAULT_OTHER
     open_session_rule: tuple[float, float] = DEFAULT_OPEN_SESSION
     announcement: tuple[float, float] = DEFAULT_ANNOUNCEMENT
-    # 默认硬约束 1.5s；若需采用核查建议的 1.0s 下限，可通过配置下调（不建议低于 0.8s）。
+    # 产品默认硬约束 1.5s（短区间 1.5–2.4s）。如需更短只能通过配置下调，不建议低于 0.8s。
     min_floor: float = OPEN_SESSION_MIN_FLOOR
 
     def range_for(self, path: str | None = None) -> tuple[float, float]:
