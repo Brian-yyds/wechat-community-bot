@@ -16,12 +16,12 @@
 
 - 采集群消息（只发送，不读取）；
 - 自动识别并填写验证码、滑块或绕过异常弹窗；
-- 保证发到正确会话——若屏幕上找不到配置的群名，会直接中止；
+- 保证发到正确会话——群名按规范化（去空白/全半角/大小写）后的**严格精确匹配**确认，屏幕上只有「主群」不会匹配「交易会员群-主群」；匹配不唯一或不确定则写入 `PAUSE` 并中止；
 - 在无桌面会话、锁屏、最小化到不可截屏的情况下工作。
 
 ## 必须遵守的安全约定
 
-1. **限速**：生产路径必须继续走 `HumanizedSender`（现有 `src/ratelimit` 层），不要绕过它直接狂点。适配器也可注入 `RateLimiter`；直接调用 `send_text` 且 `enforce_rate_limit=true` 时会自行获取令牌。与 HumanizedSender 叠用同一限速器时，请把 `enforce_rate_limit` 设为 `false`，避免令牌被扣两次。
+1. **限速**：生产路径必须继续走 `HumanizedSender`（现有 `src/ratelimit` 层），不要绕过它直接狂点。适配器也可注入 `RateLimiter`；`enforce_rate_limit=true` 时会自行获取令牌。与 HumanizedSender 叠用同一限速器时，请把 `enforce_rate_limit` 设为 `false`，避免令牌被扣两次。**无论该开关是否打开**，`send_text` 都会执行适配器内的每小时上限（默认 40 条，可配 `global_replies_per_hour` 或沿用 `rate_limit.global_replies_per_hour`），直接调用也不能绕过。
 2. **紧急暂停**：与 B（UIA 发送）使用同一约定，见 `src/adapters/pause.py`。默认文件是 `<data_dir>/PAUSE`（可用环境变量 `WECHAT_BOT_PAUSE_FILE` 覆盖）。文件存在就停止一切点击和粘贴。一键暂停：创建该空文件。恢复：人工确认后删除。
 3. **验证码 / 异常弹窗**：OCR 或屏幕文字命中「验证码」「安全验证」「异常登录」「环境异常」「请完成验证」「滑块」「账号异常」等时，立即写入 `PAUSE` 并停止，等待人工处理。没有自动打码或重试登录。
 4. **幂等**：同一 `group_id` + 同一文案在配置的时间窗内（默认 600 秒）不重复发送，状态写在 `data/ocr_idempotency.json`，重启后仍生效。
@@ -45,6 +45,7 @@ input_pause_max = 1.2
 idempotency_window_seconds = 600
 # 直接调用 send_text 时是否自行扣令牌；经 HumanizedSender 时建议 false
 enforce_rate_limit = false
+# global_replies_per_hour = 40  # 直接 send_text 也会执行
 # pause_file = "data/PAUSE"
 ```
 

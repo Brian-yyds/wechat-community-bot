@@ -42,6 +42,8 @@ inbound:
     poll_interval_seconds: 1.0
     suppressed_groups: []
     wake_a_on_preview: true
+    wake_budget_per_poll: 20
+    merge_wake_by_group: true
 
 # 适配器 B：官方 PC 微信 UIA 发送。仅在用户 Windows 把 wechat.outbound 改为 uia。
 # 紧急暂停与 D 共用 data/PAUSE。详见 docs/ADAPTER_B.md。

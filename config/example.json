@@ -166,7 +166,9 @@
       "source": "fake",
       "poll_interval_seconds": 1.0,
       "suppressed_groups": [],
-      "wake_a_on_preview": true
+      "wake_a_on_preview": true,
+      "wake_budget_per_poll": 20,
+      "merge_wake_by_group": true
     }
   },
   "outbound": {

@@ -75,7 +75,10 @@ enabled = false
 source = "fake"              # fake（box 测试）或 windows（未验证骨架）
 poll_interval_seconds = 1.0
 suppressed_groups = []
-wake_a_on_preview = true
+wake_a_on_preview = true   # 设为 false 时不会自动把唤醒钩子接到 A
+# from_config 默认开启本轮唤醒预算与按群合并，避免通知洪泛打满 A
+wake_budget_per_poll = 20
+merge_wake_by_group = true
 
 # 适配器 D：OCR 降级发送，仅为 UIA 失效时的备选，延迟可能十余秒。见 docs/ADAPTER_D.md。
 # box 上请保持 driver=fake，并保持 dry_run=true。紧急暂停与 B 共用 data/PAUSE。
@@ -87,8 +90,10 @@ confirm_group_name = true
 input_pause_min = 0.4
 input_pause_max = 1.2
 idempotency_window_seconds = 600
-# 经 HumanizedSender 发送时保持 false，避免令牌被扣两次
+# 经 HumanizedSender 发送时保持 false，避免令牌被扣两次。
+# 即使为 false，适配器仍会执行每小时上限（默认 40，或沿用 rate_limit.global_replies_per_hour）。
 enforce_rate_limit = false
+# global_replies_per_hour = 40
 # pause_file = "data/PAUSE"
 
 # 示例配置（可直接用于演示）。真实密钥与本地覆盖请使用 config/local.toml（已 gitignore）。

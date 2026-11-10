@@ -37,7 +37,9 @@ poll_interval_seconds = 1.0
 # 免打扰或明确不需要唤醒的群名
 suppressed_groups = []
 # 当读取侧是 A 时，建议打开，收到预览就催促 A 轮询
-wake_a_on_preview = true
+wake_a_on_preview = true   # false 时 factory 不会自动把唤醒钩子接到 A
+wake_budget_per_poll = 20  # from_config 默认；直接构造适配器时默认不限额
+merge_wake_by_group = true
 ```
 
 也把通知当作「辅助旁路」、主读取仍走 A 时，保持 `wechat.inbound = "local_capture"`，并设置：
@@ -48,7 +50,9 @@ enabled = true
 wake_a_on_preview = true
 ```
 
-`build_adapter()` 会把通知适配器挂到 `CompositeAdapter.notification`，并把唤醒钩子接到主读取适配器的 `request_immediate_poll(hint)`（A 应实现该方法；未实现则忽略）。
+`build_adapter()` 会把通知适配器挂到 `CompositeAdapter.notification`。当 `wake_a_on_preview = true`（默认，与示例配置一致）时，把唤醒钩子接到主读取适配器的 `request_immediate_poll(hint)`（A 应实现该方法；未实现则退回 `poll_once` / `poll`）。设为 `false` 时**不会**自动设置 `wake_target`，也不会给通知适配器挂默认回调。
+
+不要把 `wechat.inbound = "notification"` 配成唯一消息源。预览事件带 `extra["partial"] = True`，管线只记录、不自动回复，完整正文须由 A 拉取。
 
 ## 部署（Windows）
 
