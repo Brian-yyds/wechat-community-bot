@@ -22,11 +22,14 @@ from src.adapters.composite import CompositeAdapter
 from src.adapters.factory import build_adapter
 from src.adapters.local_capture import LocalCaptureAdapter
 from src.adapters.local_db import (
+    CursorCorruptError,
     EnvFileKeyProvider,
     KeyNotConfiguredError,
+    KeyPermissionError,
     LocalDbCorruptError,
     LocalDbLockedError,
     LocalDbReader,
+    SqliteDbReader,
     build_simulated_wechat_db,
     catch_up,
     insert_simulated_message,
@@ -381,3 +384,83 @@ def test_poll_delay_config_default_around_one_second():
     delays = [adapter._next_delay() for _ in range(30)]
     assert all(0.85 <= d <= 1.15 for d in delays)
     assert min(delays) < 1.0 <= max(delays) or (min(delays) <= 1.0 <= max(delays))
+
+
+def test_corrupt_cursor_falls_back_to_backup_without_replay(tmp_path: Path):
+    db = _make_simple_db(tmp_path)
+    ids = [f"cur-{i:04d}" for i in range(6)]
+    t0 = datetime(2026, 11, 11, 10, 0, 0, tzinfo=SHANGHAI)
+    for i, mid in enumerate(ids):
+        db.insert(msg_id=mid, group_id="g1", sender_id="u", content=mid, ts=t0 + timedelta(seconds=i))
+    cursor = tmp_path / "cursor.json"
+    reader = LocalDbReader(db.path, cursor_store=cursor)
+    assert [m["msg_id"] for m in reader.poll()] == ids
+    reader.close()
+    assert cursor.with_suffix(".json.bak").is_file() or (cursor.parent / (cursor.name + ".bak")).is_file() or cursor.with_name(cursor.name + ".bak").is_file() or cursor.with_suffix(cursor.suffix + ".bak").is_file()
+    cursor.write_text('{"last_seq": 6, "seen_ids": ["cur-0000",', encoding="utf-8")
+    reader2 = LocalDbReader(db.path, cursor_store=cursor)
+    assert [m["msg_id"] for m in reader2.poll()] == []
+    # 损坏主文件应被改名隔离
+    isolated = list(cursor.parent.glob("cursor.json.corrupt-*"))
+    assert isolated, "损坏游标应被隔离改名保存"
+
+
+def test_corrupt_cursor_without_backup_raises(tmp_path: Path):
+    db = _make_simple_db(tmp_path)
+    db.insert(msg_id="x", group_id="g1", sender_id="u", content="x", ts=datetime(2026, 11, 11, tzinfo=SHANGHAI))
+    cursor = tmp_path / "cursor.json"
+    cursor.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(CursorCorruptError, match="损坏"):
+        LocalDbReader(db.path, cursor_store=cursor)
+    isolated = list(cursor.parent.glob("cursor.json.corrupt-*"))
+    assert isolated
+
+
+def test_trim_seen_window_caps_memory(tmp_path: Path):
+    db = _make_simple_db(tmp_path)
+    t0 = datetime(2026, 11, 11, 10, 0, 0, tzinfo=SHANGHAI)
+    for i in range(40):
+        db.insert(msg_id=f"w-{i:04d}", group_id="g1", sender_id="u", content=str(i), ts=t0 + timedelta(seconds=i))
+    reader = LocalDbReader(db.path, cursor_store={}, seen_ids_max=15, seen_seq_window=10)
+    got = reader.poll(limit=200)
+    assert len(got) == 40
+    assert len(reader.get_cursor()["seen_ids"]) <= 15
+    assert not hasattr(reader, "prune_seen_ids")
+
+
+def test_reconcile_recent_fills_gap_left_by_poll(tmp_path: Path):
+    db = _make_simple_db(tmp_path)
+    t0 = datetime(2026, 11, 11, 10, 0, 0, tzinfo=SHANGHAI)
+    ids = []
+    for i in range(5):
+        mid = f"gap-{i:04d}"
+        db.insert(msg_id=mid, group_id="g1", sender_id="u", content=mid, ts=t0 + timedelta(seconds=i))
+        ids.append(mid)
+    reader = LocalDbReader(db.path, cursor_store={})
+    reader.poll()
+    seen = set(ids)
+    seen.discard("gap-0002")
+    reader.set_cursor({"last_seq": 5, "seen_ids": seen})
+    assert reader.poll() == []
+    filled = reader.reconcile_recent(seq_back=10)
+    assert [m["msg_id"] for m in filled] == ["gap-0002"]
+    assert reader.reconcile_recent(seq_back=10) == []
+
+
+def test_assert_readonly_rejects_writable_and_closes(tmp_path: Path, monkeypatch):
+    db = _make_simple_db(tmp_path)
+    db.insert(msg_id="p0", group_id="g1", sender_id="u", content="探测", ts=datetime(2026, 11, 11, tzinfo=SHANGHAI))
+
+    def _writable_connect(self):
+        conn = __import__("sqlite3").connect(str(self.db_path), timeout=self.timeout)
+        conn.row_factory = __import__("sqlite3").Row
+        return conn
+
+    monkeypatch.setattr(SqliteDbReader, "_connect", _writable_connect)
+    reader = LocalDbReader(db.path, cursor_store={})
+    with pytest.raises(AssertionError, match="只读"):
+        reader.assert_readonly()
+    assert getattr(reader._reader, "_conn", None) is None
+    assert "probe" not in {r["msg_id"] for r in db.all_messages()}
+    reader.close()
+
