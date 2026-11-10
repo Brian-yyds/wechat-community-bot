@@ -12,10 +12,12 @@ _PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 _WXID_RE = re.compile(r"wxid_[a-zA-Z0-9_-]+", re.IGNORECASE)
 # 邮箱。
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# 赋值形式的密钥：token= / api_key: / secret= 等。
+# 赋值形式的密钥：token= / api_key: / secret= / WECHAT_LOCAL_DB_KEY= / *_KEY= / key: 等。
 _SECRET_ASSIGN_RE = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
-    r"secret|password|passwd|authorization|token|bearer)\s*[:=]\s*([^\s,;，。]+)"
+    r"(?i)(?<![A-Za-z0-9])(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+    r"secret|password|passwd|authorization|token|bearer|"
+    r"wechat_local_db_key|db[_-]?key|[A-Za-z0-9_]*_key|key)"
+    r"\s*[:=]\s*([^\s,;，。]+)"
 )
 # Bearer 头。
 _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+([A-Za-z0-9._\-+/=]{8,})")
@@ -24,9 +26,11 @@ _WXNAME_RE = re.compile(r"(微信号|微信)\s*[:：]?\s*([A-Za-z][A-Za-z0-9_\-]
 # token 后的第二段，如 “token xxx yyy” 中的 xxx。
 _TOKEN_SPACE_RE = re.compile(r"(?i)\b(access[_-]?token|refresh[_-]?token|api[_-]?key|token)\s+([A-Za-z0-9._+/=-]{6,})")
 
+# 键名匹配：含 token/secret，以及精确的 key、*_key、db_key、WECHAT_LOCAL_DB_KEY。
+# 不用裸子串 "key"，以免把 keywords 等配置项误遮蔽。
 _SENSITIVE_KEY_RE = re.compile(
     r"(token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|"
-    r"appsecret|wxid|session)",
+    r"appsecret|wxid|session|db[_-]?key|wechat_local_db_key|(?:^|_)key$)",
     re.IGNORECASE,
 )
 
