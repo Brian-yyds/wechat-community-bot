@@ -285,7 +285,29 @@ class AnnouncementScheduler:
             self._last_fired[event.announcement_id] = event.occurrence
         if self.sender is not None:
             for group_id in event.groups:
-                self.sender.submit_announcement(group_id, event.text)
+                trace = self._announcement_trace(event, group_id)
+                try:
+                    self.sender.submit_announcement(group_id, event.text, trace=trace)
+                except TypeError:
+                    self.sender.submit_announcement(group_id, event.text)
+
+    def _announcement_trace(self, event: FireEvent, group_id: str):
+        """为定时公告构造延迟打点：含运行侧需要的元数据，不含正文。"""
+        from src.latency import LatencyTrace
+
+        now = self.clock.now()
+        return LatencyTrace(
+            message_id=f"announcement:{event.announcement_id}:{group_id}",
+            group_id=group_id,
+            kind="announcement",
+            preview=event.text or "",
+            message_at=event.fire_at or now,
+            detected_at=now,
+            extra={
+                "announcement_id": event.announcement_id,
+                "reason": event.reason,
+            },
+        )
 
     def _loop(self) -> None:
         while not self._stop.is_set():
