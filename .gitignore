@@ -30,3 +30,8 @@ tests/data/generated/
 tests/.venv/
 tests/.last_results.json
 tests/REPORT.md
+
+# 适配器测试产生的紧急暂停/告警文件不得入库
+tests/data/PAUSE
+tests/data/uia_alerts.jsonl
+tests/data/uia_sent_ids.json

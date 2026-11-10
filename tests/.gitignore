@@ -6,3 +6,6 @@ REPORT.md
 /*.xml
 /data/generated/
 *.pyc
+/data/PAUSE
+/data/uia_alerts.jsonl
+/data/uia_sent_ids.json

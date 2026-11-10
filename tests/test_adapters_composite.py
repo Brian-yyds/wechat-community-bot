@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.adapters.base import Group
 from src.adapters.composite import CompositeAdapter
 from src.adapters.factory import AdapterNotImplementedError, build_adapter
@@ -26,10 +24,23 @@ def test_composite_read_and_send_are_independent(clock: FakeClock):
     combo.stop()
 
 
-def test_build_adapter_mock_and_pending_slots():
+def test_build_adapter_mock_and_pending_slots(tmp_path):
     adapter = build_adapter({"wechat": {"inbound": "mock", "outbound": "mock"}})
     assert isinstance(adapter, MockAdapter)
-    with pytest.raises(AdapterNotImplementedError, match="尚未在第一阶段实现"):
-        build_adapter({"wechat": {"inbound": "local_capture", "outbound": "mock"}})
-    with pytest.raises(AdapterNotImplementedError, match="尚未在第一阶段实现"):
-        build_adapter({"wechat": {"inbound": "mock", "outbound": "uia"}})
+    combo = build_adapter(
+        {
+            "wechat": {"inbound": "mock", "outbound": "uia"},
+            "bot": {"data_dir": str(tmp_path)},
+            "outbound": {
+                "uia": {
+                    "data_dir": str(tmp_path),
+                    "pause_flag": str(tmp_path / "PAUSE"),
+                    "preheat_on_start": False,
+                }
+            },
+        }
+    )
+    assert isinstance(combo, CompositeAdapter)
+    from src.adapters.uia import UiaOutboundAdapter
+
+    assert isinstance(combo.outbound, UiaOutboundAdapter)
