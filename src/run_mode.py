@@ -12,6 +12,9 @@
 
 模式与暂停必须在发送出口强制执行：上游即使误提交，也不真正发出。
 不允许的发送一律丢弃并记日志。
+
+运行模式可写入共享 store 或 ``data/run_mode.json``，重启后恢复。
+配置文件里显式设置的 ``run.mode`` 优先于状态文件；状态文件缺失或损坏时回到 observe。
 """
 
 from __future__ import annotations
@@ -20,7 +23,9 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from src.persist import atomic_write_json, read_json
 
 if TYPE_CHECKING:
     from src.adapters.pause import PauseGate
@@ -103,6 +108,9 @@ class SendGate:
 
     未注入闸门时，发送器保持原有行为（允许发送），以免破坏既有单测。
     由 ``build_app`` 根据配置装配闸门后，默认模式为 observe。
+
+    运行时 ``set_mode`` 会写入 store 与状态文件，重建时可恢复。
+    若 ``config_explicit=True``，则以配置文件中的模式为准。
     """
 
     def __init__(
@@ -110,19 +118,93 @@ class SendGate:
         mode: RunMode | str = RunMode.OBSERVE,
         pause_gate: PauseGate | None = None,
         logger: logging.Logger | None = None,
+        store: dict[str, Any] | None = None,
+        state_path: str | Path | None = None,
+        *,
+        config_explicit: bool = False,
+        **kwargs: Any,
     ) -> None:
-        self.mode = parse_run_mode(mode) if not isinstance(mode, RunMode) else mode
+        if "store" in kwargs:
+            store = kwargs["store"]
+        if "state_path" in kwargs:
+            state_path = kwargs["state_path"]
+        if "mode" in kwargs:
+            mode = kwargs["mode"]
+        self.store = store
+        self.state_path = Path(state_path) if state_path else None
         self.pause_gate = pause_gate
         self.logger = logger or logging.getLogger("wechat_bot")
+        self.config_explicit = bool(config_explicit)
+        if self.config_explicit:
+            self.mode = parse_run_mode(mode)
+            self._persist()
+        else:
+            restored = self._restore()
+            self.mode = restored if restored is not None else parse_run_mode(mode)
+            # 首次以传入的 mode 启动且尚无状态时，不必强制写盘；set_mode 才会持久化。
+            if restored is not None:
+                self._persist()
 
-    def is_paused(self) -> bool:
-        return bool(self.pause_gate is not None and self.pause_gate.is_paused())
+    def _restore(self) -> RunMode | None:
+        raw = None
+        had_source = False
+        if isinstance(self.store, dict) and "run_mode" in self.store:
+            raw = self.store.get("run_mode")
+            had_source = True
+        elif self.state_path is not None and self.state_path.exists():
+            had_source = True
+            loaded = read_json(self.state_path, default=None)
+            if isinstance(loaded, dict):
+                raw = loaded.get("run_mode")
+            elif isinstance(loaded, str):
+                raw = loaded
+        if not raw:
+            # 状态存在但为空/损坏时回到 observe；缺失则交给构造参数。
+            return RunMode.OBSERVE if had_source else None
+        try:
+            return parse_run_mode(raw)
+        except RunModeError:
+            return RunMode.OBSERVE if had_source else None
+
+    def _persist(self) -> None:
+        value = self.mode.value if isinstance(self.mode, RunMode) else str(self.mode)
+        if isinstance(self.store, dict):
+            self.store["run_mode"] = value
+        if self.state_path is not None:
+            try:
+                atomic_write_json(self.state_path, {"run_mode": value})
+            except OSError as exc:
+                self.logger.warning("写入运行模式状态失败: %s", exc)
+
+    def get_mode(self) -> str:
+        return self.mode.value if isinstance(self.mode, RunMode) else str(self.mode)
+
+    def set_mode(self, mode: RunMode | str) -> str:
+        previous = self.get_mode()
+        self.mode = parse_run_mode(mode)
+        self._persist()
+        current = self.get_mode()
+        self.logger.info("运行模式已切换：%s → %s", previous, current)
+        return current
+
+    def allow_send(self, kind: str = "reply") -> bool:
+        return mode_allows(self.mode, kind)
 
     def allow_auto_reply(self) -> bool:
         return mode_allows(self.mode, KIND_AUTO_REPLY)
 
     def allow_announcement(self) -> bool:
         return mode_allows(self.mode, KIND_ANNOUNCEMENT)
+
+    def is_paused(self) -> bool:
+        if self.pause_gate is None:
+            return False
+        try:
+            return bool(self.pause_gate.is_paused())
+        except OSError as exc:
+            # 无法确认 PAUSE 时默认视为已暂停，避免误发。
+            self.logger.warning("无法读取暂停标记，默认拒绝发送: %s", exc)
+            return True
 
     def decide(self, kind: object) -> GateDecision:
         """在发送出口判定是否允许真正发出。"""
