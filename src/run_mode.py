@@ -43,6 +43,18 @@ class RunMode(str, Enum):
 
 VALID_MODES = tuple(mode.value for mode in RunMode)
 
+# 启动日志里的来源说明。
+MODE_SOURCE_LABELS = {
+    "--mode": "--mode",
+    "mode_force": "配置 mode_force",
+    "state": "状态文件",
+    "state_corrupt": "状态文件损坏，已回退为 observe",
+    "config": "配置",
+    "default": "默认",
+    "invalid": "配置或参数非法，已回退为 observe",
+    "set_mode": "运行时 set_mode",
+}
+
 # 与发送类型名保持一致，便于发送器直接传入。
 KIND_AUTO_REPLY = "auto_reply"
 KIND_ANNOUNCEMENT = "announcement"
@@ -105,6 +117,15 @@ class GateDecision:
         return "send" if self.allowed else "drop"
 
 
+
+def canonicalize_run_mode(value: object | None) -> str:
+    """只接受 observe / announce / reply；非法或损坏时返回 observe。"""
+    try:
+        return parse_run_mode(value).value
+    except RunModeError:
+        return RunMode.OBSERVE.value
+
+
 class SendGate:
     """发送出口统一闸门：先看紧急暂停，再看运行模式。
 
@@ -124,6 +145,7 @@ class SendGate:
         state_path: str | Path | None = None,
         *,
         config_explicit: bool = False,
+        intended_source: str | None = None,
         **kwargs: Any,
     ) -> None:
         if "store" in kwargs:
@@ -137,17 +159,22 @@ class SendGate:
         self.pause_gate = pause_gate
         self.logger = logger or logging.getLogger("wechat_bot")
         self.config_explicit = bool(config_explicit)
+        self.mode_source = intended_source or "default"
         if self.config_explicit:
             self.mode = parse_run_mode(mode)
+            self.mode_source = intended_source or "mode_force"
             self._persist()
         else:
-            restored = self._restore()
-            self.mode = restored if restored is not None else parse_run_mode(mode)
-            # 首次以传入的 mode 启动且尚无状态时，不必强制写盘；set_mode 才会持久化。
+            restored, restore_source = self._restore()
             if restored is not None:
+                self.mode = restored
+                self.mode_source = restore_source or "state"
                 self._persist()
+            else:
+                self.mode = parse_run_mode(mode)
+                self.mode_source = intended_source or "default"
 
-    def _restore(self) -> RunMode | None:
+    def _restore(self) -> tuple[RunMode | None, str | None]:
         raw = None
         had_source = False
         if isinstance(self.store, dict) and "run_mode" in self.store:
@@ -160,16 +187,31 @@ class SendGate:
                 raw = loaded.get("run_mode")
             elif isinstance(loaded, str):
                 raw = loaded
+            elif loaded is None:
+                raw = None
+            else:
+                raw = None
+        if not had_source:
+            return None, None
         if not raw:
-            # 状态存在但为空/损坏时回到 observe；缺失则交给构造参数。
-            return RunMode.OBSERVE if had_source else None
+            # 状态存在但为空/损坏时回到 observe。
+            self.logger.warning("运行模式状态文件为空或损坏，已回退到 observe")
+            return RunMode.OBSERVE, "state_corrupt"
         try:
-            return parse_run_mode(raw)
+            return parse_run_mode(raw), "state"
         except RunModeError:
-            return RunMode.OBSERVE if had_source else None
+            self.logger.warning("运行模式状态非法（%r），已回退到 observe", raw)
+            return RunMode.OBSERVE, "state_corrupt"
 
     def _persist(self) -> None:
-        value = self.mode.value if isinstance(self.mode, RunMode) else str(self.mode)
+        # 只写入合法值；格式或取值异常时改为 observe，避免下次读入脏数据。
+        try:
+            value = canonicalize_run_mode(self.mode)
+        except Exception:
+            value = RunMode.OBSERVE.value
+        if value not in VALID_MODES:
+            value = RunMode.OBSERVE.value
+        self.mode = parse_run_mode(value)
         if isinstance(self.store, dict):
             self.store["run_mode"] = value
         if self.state_path is not None:
@@ -186,8 +228,13 @@ class SendGate:
         self.mode = parse_run_mode(mode)
         self._persist()
         current = self.get_mode()
+        self.mode_source = "set_mode"
         self.logger.info("运行模式已切换：%s → %s", previous, current)
         return current
+
+    def describe_source(self) -> str:
+        """供启动日志使用的来源说明。"""
+        return MODE_SOURCE_LABELS.get(self.mode_source, self.mode_source or "默认")
 
     def allow_send(self, kind: str = "reply") -> bool:
         return mode_allows(self.mode, kind)
