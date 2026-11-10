@@ -61,8 +61,11 @@ class PauseGate:
         self.path = resolve_pause_path(path, data_dir=data_dir)
 
     def is_paused(self) -> bool:
-        """文件存在即为暂停。"""
-        return self.path.exists()
+        """文件存在即为暂停。stat/读取失败时默认视为已暂停，避免误发。"""
+        try:
+            return self.path.exists()
+        except OSError:
+            return True
 
     def check(self) -> None:
         """若已暂停则抛出 SendPausedError。"""
@@ -90,8 +93,9 @@ class PauseGate:
         return self.path
 
     def resume(self) -> bool:
-        """删除暂停文件。文件本不存在时返回 False。"""
-        if not self.path.exists():
+        """删除暂停文件。文件本不存在时返回 False，不先 exists 再 unlink，以免竞态。"""
+        try:
+            self.path.unlink()
+            return True
+        except FileNotFoundError:
             return False
-        self.path.unlink()
-        return True
