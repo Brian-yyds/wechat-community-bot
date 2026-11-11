@@ -1,0 +1,7 @@
+======== 通知适配器自检（dry-run） ========
+OK   模块导入成功（未在顶层加载 Windows 依赖）
+OK   配置: 未指定，使用内置默认
+OK   完整性声明：is_complete_source=False
+OK   Fake 源产出 1 条 partial 预览，并触发唤醒回调
+OK   跳过真实 Windows 源（默认 dry-run；需要时加 --live）
+======== 自检 通过 ========

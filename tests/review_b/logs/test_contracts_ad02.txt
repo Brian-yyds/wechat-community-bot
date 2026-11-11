@@ -1,0 +1,6 @@
+============================= test session starts ==============================
+collected 17 items / 14 deselected / 3 selected
+
+tests/test_adapter_contracts.py ...                                      [100%]
+
+======================= 3 passed, 14 deselected in 0.05s =======================

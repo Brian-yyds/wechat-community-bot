@@ -1,0 +1,20 @@
+.................................FF...............                       [100%]
+=================================== FAILURES ===================================
+____________ test_window_title_spaces_ok_fullwidth_should_normalize ____________
+tests/review_b/test_b_retest_gates_and_driver_boundary.py:282: in test_window_title_spaces_ok_fullwidth_should_normalize
+    assert result.ok, (
+E   AssertionError: 窗口标题仅全半角差异时应规范化后视为同一会话，避免误报 target_not_found； 实际 status=target_not_found error="打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: '交易会员群－主群' != '交易会员群-主群'" titles_match=False
+E   assert False
+E    +  where False = UiaSendResult(ok=False, status='target_not_found', group='g1', text='全半角应能匹配', error="打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: '交易...39938664622605e-06, adapter_total=3.516300057526678e-05, chat_was_open=False), send_id=None, skipped=False, attempts=1).ok
+___________ test_non_uia_error_during_paste_is_contained_and_pauses ____________
+tests/review_b/test_b_retest_gates_and_driver_boundary.py:299: in test_non_uia_error_during_paste_is_contained_and_pauses
+    result = adapter.send("g1", "异常应收敛")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/adapters/uia.py:537: in send
+    self.driver.paste_text(text)
+tests/review_b/test_b_retest_gates_and_driver_boundary.py:295: in paste_text
+    raise RuntimeError("粘贴时意外失败")
+E   RuntimeError: 粘贴时意外失败
+=========================== short test summary info ============================
+FAILED tests/review_b/test_b_retest_gates_and_driver_boundary.py::test_window_title_spaces_ok_fullwidth_should_normalize
+FAILED tests/review_b/test_b_retest_gates_and_driver_boundary.py::test_non_uia_error_during_paste_is_contained_and_pauses

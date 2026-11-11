@@ -1,0 +1,36 @@
+........................................................................ [  7%]
+....................FF.................................................. [ 15%]
+F....................................................................... [ 23%]
+........................................................................ [ 31%]
+........................................................................ [ 39%]
+........................................................................ [ 47%]
+........................................................................ [ 55%]
+........................................................................ [ 63%]
+........................................................................ [ 71%]
+........................................................................ [ 79%]
+........................................................................ [ 87%]
+........................................................................ [ 95%]
+.....................................s....                               [100%]
+=================================== FAILURES ===================================
+E   AssertionError: 窗口标题仅全半角差异时应规范化后视为同一会话，避免误报 target_not_found； 实际 status=target_not_found error="打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: '交易会员群－主群' != '交易会员群-主群'" titles_match=False
+    assert False
+     +  where False = UiaSendResult(ok=False, status='target_not_found', group='g1', text='全半角应能匹配', error="打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: '交易...0006347596645e-06, adapter_total=3.0786002753302455e-05, chat_was_open=False), send_id=None, skipped=False, attempts=1).ok
+/workspace/wechat-community-bot/tests/review_b/test_b_retest_gates_and_driver_boundary.py:282: AssertionError: 窗口标题仅全半角差异时应规范化后视为同一会话，避免误报 target_not_found； 实际 status=target_not_found error="打开会话后窗口标题与目标群不一致（规范化精确匹配失败）: '交易会员群－主群' != '交易会员群-主群'" titles_match=False
+E   RuntimeError: 粘贴时意外失败
+/workspace/wechat-community-bot/tests/review_b/test_b_retest_gates_and_driver_boundary.py:295: RuntimeError: 粘贴时意外失败
+E   AssertionError: OcrOutboundAdapter 未实现 attach_official_sender，直接 send_text 在无闸门时仍发出：['直发绕过 observe']
+    assert ['直发绕过 observe'] == []
+      
+      Left contains one more item: '直发绕过 observe'
+      Use -v to get more diff
+/workspace/wechat-community-bot/tests/review_cd/test_retest_fixes.py:306: AssertionError: OcrOutboundAdapter 未实现 attach_official_sender，直接 send_text 在无闸门时仍发出：['直发绕过 observe']
+=============================== warnings summary ===============================
+tests/test_adapter_notification.py::test_role_is_implemented_and_factory_builds_it
+  /workspace/wechat-community-bot/tests/test_adapter_notification.py:151: UserWarning: wechat.inbound=notification 不能作为唯一消息源。预览可能被截断，只应用于唤醒或记录；请与 local_capture 组合。管线不会对 partial=True 的预览自动回复。
+    adapter = build_adapter(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/review_b/test_b_retest_gates_and_driver_boundary.py::test_window_title_spaces_ok_fullwidth_should_normalize
+FAILED tests/review_b/test_b_retest_gates_and_driver_boundary.py::test_non_uia_error_during_paste_is_contained_and_pauses
+FAILED tests/review_cd/test_retest_fixes.py::test_direct_send_text_must_not_bypass_run_mode

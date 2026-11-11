@@ -1,0 +1,9 @@
+======== OCR 适配器自检（dry-run，不会真实点击） ========
+OK   模块导入成功（未在顶层加载 pyautogui / OCR 引擎）
+OK   配置: 使用内置默认
+OK   Fake dry-run 走通：已定位且未点击
+OK   紧急暂停生效（/workspace/wechat-community-bot/data/selfcheck/PAUSE）
+OK   验证码检测会写入 PAUSE 并停止
+OK   跳过真实 Windows 驱动（默认 dry-run；需要时加 --live，仍不会点击）
+说明：OCR 降级发送延迟可能达十余秒，只应作为 UIA 失败后的备选。
+======== 自检 通过 ========

@@ -2,7 +2,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 .last_results.json
-REPORT.md
 /*.xml
 /data/generated/
 *.pyc

@@ -1,0 +1,27 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-9.2.0, pluggy-1.7.0
+rootdir: /workspace/wechat-community-bot
+configfile: pytest.ini
+collected 27 items
+
+tests/review_cd/test_cd_security.py .....                                [ 18%]
+tests/review_cd/test_notification_supplement.py .......F                 [ 48%]
+tests/review_cd/test_ocr_supplement.py .F............                    [100%]
+
+=================================== FAILURES ===================================
+_____________ test_wake_a_on_preview_false_must_not_auto_wire_wake _____________
+tests/review_cd/test_notification_supplement.py:181: in test_wake_a_on_preview_false_must_not_auto_wire_wake
+    assert adapter.notification.wake_callback is None, (
+E   AssertionError: wake_a_on_preview=false 时不应自动挂上唤醒回调，实际已挂 <function default_wake_callback.<locals>._wake at 0x7f8a1fcab4c0>
+E   assert <function default_wake_callback.<locals>._wake at 0x7f8a1fcab4c0> is None
+E    +  where <function default_wake_callback.<locals>._wake at 0x7f8a1fcab4c0> = <src.adapters.notification.NotificationAdapter object at 0x7f8a1ffe4d10>.wake_callback
+E    +    where <src.adapters.notification.NotificationAdapter object at 0x7f8a1ffe4d10> = <src.adapters.composite.CompositeAdapter object at 0x7f8a1ff5ed50>.notification
+_________ test_ocr_misread_group_substring_must_not_send_to_wrong_chat _________
+tests/review_cd/test_ocr_supplement.py:84: in test_ocr_misread_group_substring_must_not_send_to_wrong_chat
+    with pytest.raises(GroupNotConfirmedError, match="确认群名"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE GroupNotConfirmedError
+=========================== short test summary info ============================
+FAILED tests/review_cd/test_notification_supplement.py::test_wake_a_on_preview_false_must_not_auto_wire_wake
+FAILED tests/review_cd/test_ocr_supplement.py::test_ocr_misread_group_substring_must_not_send_to_wrong_chat
+========================= 2 failed, 25 passed in 0.16s =========================

@@ -1,0 +1,126 @@
+============================= test session starts ==============================
+collected 39 items
+
+tests/review_b/test_b_bypass_and_gates.py ...FFF                         [ 15%]
+tests/review_b/test_b_latency_security.py .FFF.....                      [ 38%]
+tests/review_b/test_b_pause_idempotency.py ......F.F..F                  [ 69%]
+tests/review_b/test_b_send_correctness.py ...FF..F.FF.                   [100%]
+
+=================================== FAILURES ===================================
+____________ test_pause_flag_is_not_rechecked_before_paste_or_press ____________
+tests/review_b/test_b_bypass_and_gates.py:120: in test_pause_flag_is_not_rechecked_before_paste_or_press
+    assert not result.ok, "中途出现 PAUSE 后发送应失败"
+E   AssertionError: 中途出现 PAUSE 后发送应失败
+E   assert not True
+E    +  where True = UiaSendResult(ok=True, status='ok', group='g1', text='焦点后被暂停，不应再粘贴或发送', error='', elapsed=0.00010559699876466766, timi...9937606826425e-06, adapter_total=0.00010559699876466766, chat_was_open=False), send_id=None, skipped=False, attempts=1).ok
+___________ test_humanized_sender_treats_failed_uia_send_as_success ____________
+tests/review_b/test_b_bypass_and_gates.py:141: in test_humanized_sender_treats_failed_uia_send_as_success
+    assert sent == 0, f"UIA 校验失败时 HumanizedSender 仍返回 sent={sent}"
+E   AssertionError: UIA 校验失败时 HumanizedSender 仍返回 sent=1
+E   assert 1 == 0
+_________________ test_humanized_sender_does_not_pass_send_id __________________
+tests/review_b/test_b_bypass_and_gates.py:158: in test_humanized_sender_does_not_pass_send_id
+    assert sent == 1, f"无 send_id 时正式出口把相同文案发了 {sent} 次"
+E   AssertionError: 无 send_id 时正式出口把相同文案发了 2 次
+E   assert 2 == 1
+________ test_latency_jsonl_from_official_path_misses_uia_stage_fields _________
+tests/review_b/test_b_latency_security.py:107: in test_latency_jsonl_from_official_path_misses_uia_stage_fields
+    assert has_stages, (
+E   AssertionError: latency.jsonl 缺少 UIA 分段字段 open_chat/paste/send/verify；实际 keys=['message_id', 'group_id', 'kind', 'session_open', 'outcome', 'drop_reason', 'preview', 'message_at', 'detected_at', 'classified_at', 'decided_at', 'queued_at', 'send_started_at', 'sent_at', 'segments'] segments=['detect_delay_s', 'decision_s', 'rate_wait_s', 'humanize_delay_s', 'typing_delay_s', 'rate_humanize_delay_s', 'adapter_send_s', 'e2e_s', 'e2e_excluding_humanize_s'] extra={}
+E   assert False
+_______________ test_uia_alerts_and_logs_redact_phone_and_token ________________
+tests/review_b/test_b_latency_security.py:132: in test_uia_alerts_and_logs_redact_phone_and_token
+    assert "13800138000" not in raw, "uia_alerts.jsonl 未脱敏手机号"
+E   AssertionError: uia_alerts.jsonl 未脱敏手机号
+E   assert '13800138000' not in '{"code": "u...03:52:20"}\n'
+E     
+E     '13800138000' is contained here:
+E       {"code": "ui_not_ready", "message": "锁屏联系 13800138000 token=abcdEFGH123456 wxid_abcde123", "ts": "2026-11-11T03:52:20"}
+E     ?                                           +++++++++++
+------------------------------ Captured log call -------------------------------
+WARNING  src.adapters.uia:uia.py:672 UIA 告警: ui_not_ready 锁屏联系 138****8000 token=*** wxid_***
+_______________ test_pyweixin_logger_calls_are_not_all_redacted ________________
+tests/review_b/test_b_latency_security.py:151: in test_pyweixin_logger_calls_are_not_all_redacted
+    assert unredacted == [], "pyweixin_driver 存在未调用 redact 的日志输出:\n" + "\n".join(unredacted)
+E   AssertionError: pyweixin_driver 存在未调用 redact 的日志输出:
+E     198:logger.warning("查找微信窗口失败: %s", exc)
+E     296:logger.warning("校验已发送失败: %s", exc)
+E   assert ['198:logger....败: %s", exc)'] == []
+E     
+E     Left contains 2 more items, first extra item: '198:logger.warning("查找微信窗口失败: %s", exc)'
+E     Use -v to get more diff
+____ test_maybe_sent_does_not_resend_but_first_status_should_be_maybe_sent _____
+tests/review_b/test_b_pause_idempotency.py:149: in test_maybe_sent_does_not_resend_but_first_status_should_be_maybe_sent
+    assert first.status == UiaSendStatus.MAYBE_SENT, (
+E   AssertionError: 按下发送后校验失败的首次状态应为 maybe_sent，实际为 rejected
+E   assert 'rejected' == 'maybe_sent'
+E     
+E     - maybe_sent
+E     + rejected
+__________ test_corrupt_sent_id_store_must_not_silently_allow_resend ___________
+tests/review_b/test_b_pause_idempotency.py:187: in test_corrupt_sent_id_store_must_not_silently_allow_resend
+    assert again.skipped or not again.ok, (
+E   AssertionError: uia_sent_ids.json 损坏后仍成功重发同一 send_id；应失败关闭或拒绝自动重发，改由人工对账
+E   assert (False or not True)
+E    +  where False = UiaSendResult(ok=True, status='ok', group='g1', text='先发出', error='', elapsed=0.00015317799989134073, timings=StageTim...91281009e-06, adapter_total=0.00015317799989134073, chat_was_open=False), send_id='fragile', skipped=False, attempts=1).skipped
+E    +  and   True = UiaSendResult(ok=True, status='ok', group='g1', text='先发出', error='', elapsed=0.00015317799989134073, timings=StageTim...91281009e-06, adapter_total=0.00015317799989134073, chat_was_open=False), send_id='fragile', skipped=False, attempts=1).ok
+------------------------------ Captured log call -------------------------------
+WARNING  src.adapters.uia:uia.py:216 读取发送幂等记录失败，将以空记录继续: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+_____________ test_unexpected_safety_error_must_not_crash_or_send ______________
+tests/review_b/test_b_pause_idempotency.py:225: in test_unexpected_safety_error_must_not_crash_or_send
+    result = adapter.send("g1", "探活异常")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/adapters/uia.py:429: in send
+    safety = self._inspect_safety()
+             ^^^^^^^^^^^^^^^^^^^^^^
+src/adapters/uia.py:645: in _inspect_safety
+    if self.driver.is_locked():
+       ^^^^^^^^^^^^^^^^^^^^^^^
+tests/review_b/test_b_pause_idempotency.py:221: in is_locked
+    raise RuntimeError("意外探活失败")
+E   RuntimeError: 意外探活失败
+_____________ test_stale_current_chat_must_not_send_to_wrong_group _____________
+tests/review_b/test_b_send_correctness.py:73: in test_stale_current_chat_must_not_send_to_wrong_group
+    assert driver.pressed != ["二群"], "current_chat 过期时把消息发进了错误的群「二群」"
+E   AssertionError: current_chat 过期时把消息发进了错误的群「二群」
+E   assert ['二群'] != ['二群']
+E    +  where ['二群'] = test_stale_current_chat_must_not_send_to_wrong_group.<locals>.StaleCurrentDriver(fail_mode=None, stage_delays={}, know...input': 1, 'paste_text': 1, 'press_send': 1, 'verify_sent': 1}, _lock=<unlocked _thread.lock object at 0x7fe7ae71d8d0>).pressed
+_______________ test_empty_and_whitespace_text_must_be_rejected ________________
+tests/review_b/test_b_send_correctness.py:83: in test_empty_and_whitespace_text_must_be_rejected
+    assert not result.ok, f"空/空白文本不应发送，实际 status={result.status}"
+E   AssertionError: 空/空白文本不应发送，实际 status=ok
+E   assert not True
+E    +  where True = UiaSendResult(ok=True, status='ok', group='g1', text='', error='', elapsed=0.00014695800200570375, timings=StageTiming...1544329e-06, adapter_total=0.00014695800200570375, chat_was_open=False), send_id="empty-''", skipped=False, attempts=1).ok
+_____________ test_pyweixin_open_chat_does_not_verify_actual_title _____________
+tests/review_b/test_b_send_correctness.py:117: in test_pyweixin_open_chat_does_not_verify_actual_title
+    assert has_verify, (
+E   AssertionError: PyWeixinDriver._pywinauto_open_chat 在 Ctrl+F 搜索回车后不校验实际打开的会话标题，重名、同名前缀或搜索失败时可能发错群，且仍把 _current 写成目标名
+E   assert False
+__________ test_pyweixin_clipboard_fallback_does_not_restore_or_clear __________
+tests/review_b/test_b_send_correctness.py:144: in test_pyweixin_clipboard_fallback_does_not_restore_or_clear
+    assert restores, (
+E   AssertionError: 剪贴板降级路径覆盖用户剪贴板后不恢复原内容，会干扰用户复制粘贴
+E   assert False
+________ test_pyweixin_type_keys_group_name_is_unsafe_for_special_chars ________
+tests/review_b/test_b_send_correctness.py:158: in test_pyweixin_type_keys_group_name_is_unsafe_for_special_chars
+    assert "escape" in src.lower() or False, (
+E   AssertionError: _pywinauto_open_chat 使用 type_keys(group_name) 且未转义特殊字符，群名含 +、^、%、{、} 时可能按错键或打开错误会话
+E   assert ('escape' in '    def _pywinauto_open_chat(self, group_name: str) -> none:\n        """保守实现：用搜索框寻找会话。失败则明确抛错，不假装成功。"""\n        try...ise chatnotfounderror(\n                f"无法用 pywinauto 打开会话 {group_name}（未经验证的降级路径）: {exc}"\n            ) from exc\n' or False)
+E    +  where '    def _pywinauto_open_chat(self, group_name: str) -> none:\n        """保守实现：用搜索框寻找会话。失败则明确抛错，不假装成功。"""\n        try...ise chatnotfounderror(\n                f"无法用 pywinauto 打开会话 {group_name}（未经验证的降级路径）: {exc}"\n            ) from exc\n' = <built-in method lower of str object at 0x31a82a90>()
+E    +    where <built-in method lower of str object at 0x31a82a90> = '    def _pywinauto_open_chat(self, group_name: str) -> None:\n        """保守实现：用搜索框寻找会话。失败则明确抛错，不假装成功。"""\n        try...ise ChatNotFoundError(\n                f"无法用 pywinauto 打开会话 {group_name}（未经验证的降级路径）: {exc}"\n            ) from exc\n'.lower
+=========================== short test summary info ============================
+FAILED tests/review_b/test_b_bypass_and_gates.py::test_pause_flag_is_not_rechecked_before_paste_or_press
+FAILED tests/review_b/test_b_bypass_and_gates.py::test_humanized_sender_treats_failed_uia_send_as_success
+FAILED tests/review_b/test_b_bypass_and_gates.py::test_humanized_sender_does_not_pass_send_id
+FAILED tests/review_b/test_b_latency_security.py::test_latency_jsonl_from_official_path_misses_uia_stage_fields
+FAILED tests/review_b/test_b_latency_security.py::test_uia_alerts_and_logs_redact_phone_and_token
+FAILED tests/review_b/test_b_latency_security.py::test_pyweixin_logger_calls_are_not_all_redacted
+FAILED tests/review_b/test_b_pause_idempotency.py::test_maybe_sent_does_not_resend_but_first_status_should_be_maybe_sent
+FAILED tests/review_b/test_b_pause_idempotency.py::test_corrupt_sent_id_store_must_not_silently_allow_resend
+FAILED tests/review_b/test_b_pause_idempotency.py::test_unexpected_safety_error_must_not_crash_or_send
+FAILED tests/review_b/test_b_send_correctness.py::test_stale_current_chat_must_not_send_to_wrong_group
+FAILED tests/review_b/test_b_send_correctness.py::test_empty_and_whitespace_text_must_be_rejected
+FAILED tests/review_b/test_b_send_correctness.py::test_pyweixin_open_chat_does_not_verify_actual_title
+FAILED tests/review_b/test_b_send_correctness.py::test_pyweixin_clipboard_fallback_does_not_restore_or_clear
+FAILED tests/review_b/test_b_send_correctness.py::test_pyweixin_type_keys_group_name_is_unsafe_for_special_chars
+======================== 14 failed, 25 passed in 0.22s =========================

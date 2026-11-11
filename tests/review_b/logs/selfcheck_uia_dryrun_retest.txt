@@ -1,0 +1,12 @@
+======== 适配器 B 自检开始 ========
+OK   Python: Python 3.13.5（需要 >= 3.11）
+OK   平台: 当前平台 linux，只能跑 FakeUiDriver 模拟，不能驱动官方 PC 微信
+OK   依赖: 非 Windows，跳过真实依赖安装检查（模拟路径可用）
+INFO 依赖说明: 真实 UIA 只能在已登录官方 PC 微信的 Windows 桌面会话中运行。Linux box 请使用 FakeUiDriver 做模拟测试，不要指望在此直接操作微信窗口。
+OK   暂停标记: 未发现暂停标记（/workspace/wechat-community-bot/data/PAUSE）
+INFO 微信/UIA: 非 Windows，跳过进程与窗口检查
+OK   模拟分段耗时: already_open: adapter_total=0.0003s (目标 ≤3.0s, 达标)；open_chat=0.0 paste=0.0 send=0.0 verify=0.0 chat_was_open=True | unopened: adapter_total=0.0002s (目标 ≤8.0s, 达标)；open_chat=0.0 paste=0.0 send=0.0 verify=0.0 chat_was_open=False | 以上为 FakeUiDriver 模拟耗时，不含限速层 2–6 秒拟人延迟；真实 Windows 耗时请用 dry-run 观察窗口操作后再决定是否 --send-test。
+OK   发送: 未指定 --send-test，保持 dry-run，没有真实发送
+延迟目标：已打开会话适配器自身耗时 ≤ 3s；未打开会话 ≤ 8s（不含限速层拟人延迟）。
+部署注意：请用专用小号、家庭网络常驻桌面会话，窗口可见、不锁屏、不远程断连。详见 docs/ADAPTER_B.md。
+======== 适配器 B 自检 通过 ========
